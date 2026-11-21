@@ -27,6 +27,8 @@ export interface SessionAccess {
   // V2 TUI: include server-side background Jobs and queued subagent reports.
   // Absent on V1 and on server-only V2 delivery.
   hasOutstandingWork?(sessionID: string): Promise<boolean>
+  // V2 server events know parent/child lifecycle even without the Job API.
+  waitForParentResume?: boolean
 }
 
 export type Delivery = "all" | "terminal" | "command"
@@ -163,7 +165,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     // The V2 TUI can check authoritative outstanding work. After children stop,
     // keep the alert pending until the parent's NEXT successful execution.
     // A fixed grace cannot guarantee the parent has resumed.
-    if (access.hasOutstandingWork && config().deferCompleteUntilChildrenIdle) return
+    if ((access.waitForParentResume || access.hasOutstandingWork) && config().deferCompleteUntilChildrenIdle) return
     for (const [id, deferred] of pending) {
       if (deferred.grace || hasRunningChildren(id)) continue
       const grace = setTimeout(() => {

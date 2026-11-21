@@ -341,3 +341,23 @@ test("V2 strict mode expires a deferred completion instead of guessing after 2s"
   await advance(CHILDREN_SETTLE_MS * 4)
   expect(parentDone()).toBe(0)
 })
+
+test("V2 server fallback waits for parent final turn using known native child events", async () => {
+  jest.useFakeTimers()
+  notifier.dispose()
+  notifier = createNotifier({
+    info: async id => ({ isChild: id.startsWith("child"), title: id }),
+    elapsed: async () => null,
+    permissionPending: async () => true,
+    waitForParentResume: true,
+  }, directory)
+  notifier.busy("parent")
+  await notifier.created("child1", "parent", null)
+  await notifier.idle("parent")
+  await notifier.idle("child1")
+  await advance(CHILDREN_SETTLE_MS * 5)
+  expect(parentDone()).toBe(0)
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(1)
+})

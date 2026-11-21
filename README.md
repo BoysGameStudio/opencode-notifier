@@ -505,7 +505,9 @@ The plugin tracks native OpenCode child sessions and their descendants from crea
 
 **OpenCode V2 terminal client (with Job and inbox APIs):** The notifier also queries running server-side background Jobs (including descendant work) and queued synthetic subagent reports. This catches native background work whose initial session events were missed. A deferred alert is sent only after the parent executes successfully again with no outstanding Jobs/reports, rather than after a fixed 2-second grace. If the parent never resumes, the pending alert expires silently; this intentionally favors a missing alert over an incorrect "finished" alert. If a Job/inbox lookup fails, completion is deferred rather than guessed.
 
-**OpenCode V1 and V2 server-only custom commands:** The authoritative V2 APIs are not available in these entrypoints, so the original 2-second grace still applies: the parent may resume too late and produce an early alert and another at its final turn. V2 terminal notifications require a client that exposes both `experimental.job.list` and `session.inbox.list`.
+**OpenCode V2 server-only custom commands:** The authoritative Job/inbox APIs are not available in the server plugin context. Known native child sessions still defer completion until the parent executes successfully again (never a fixed 2-second grace). Unlike the V2 terminal, the server cannot detect work if child lifecycle events were missed, or an already-queued subagent result has no running child. V2 terminal notifications require a client that exposes both `experimental.job.list` and `session.inbox.list`.
+
+**OpenCode V1:** Keeps the original 2-second grace. If the parent resumes later, it can still send an early alert and another at the final turn.
 
 Third-party delegation work that is not registered in native OpenCode background Jobs or child-session events still cannot be tracked reliably.
 
