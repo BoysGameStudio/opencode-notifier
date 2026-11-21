@@ -361,3 +361,94 @@ test("V2 server fallback waits for parent final turn using known native child ev
   await notifier.idle("parent")
   expect(parentDone()).toBe(1)
 })
+
+function strictTerminalWithBlockedClaim() {
+  notifier.dispose()
+  let releaseFirstClaim!: () => void
+  let enteredFirstClaim!: () => void
+  const blocked = new Promise<void>(resolve => { releaseFirstClaim = resolve })
+  const entered = new Promise<void>(resolve => { enteredFirstClaim = resolve })
+  let calls = 0
+  notifier = createNotifier({
+    info: async id => ({ isChild: id.startsWith("child"), title: id }),
+    elapsed: async () => null,
+    permissionPending: async () => true,
+    hasOutstandingWork: async () => false,
+  }, directory, "terminal", {
+    claim: async (_key, _sessionID, valid) => {
+      if (++calls === 1) {
+        enteredFirstClaim()
+        await blocked
+      }
+      return valid()
+    },
+  })
+  return { entered, release: releaseFirstClaim }
+}
+
+test("new native child cancels an in-flight parent notification after Job check", async () => {
+  const gate = strictTerminalWithBlockedClaim()
+  notifier.busy("parent")
+  const oldCompletion = notifier.idle("parent", true, "complete:claim-child-created")
+  await gate.entered
+  await notifier.created("child1", "parent", null)
+  gate.release()
+  await oldCompletion
+  expect(parentDone()).toBe(0)
+
+  await notifier.idle("child1")
+  notifier.busy("parent")
+  await notifier.idle("parent", true, "complete:claim-parent-final")
+  expect(parentDone()).toBe(1)
+})
+
+test("restarted existing child cancels an in-flight parent completion", async () => {
+  await notifier.created("child1", "parent", null)
+  await notifier.idle("child1")
+  const gate = strictTerminalWithBlockedClaim()
+  // The strict notifier tracks the same child in this fresh instance.
+  await notifier.created("child1", "parent", null)
+  await notifier.idle("child1")
+  notifier.busy("parent")
+  const oldCompletion = notifier.idle("parent", true, "complete:claim-child-restart")
+  await gate.entered
+  notifier.busy("child1")
+  await notifier.idle("child1")
+  gate.release()
+  await oldCompletion
+  expect(parentDone()).toBe(0)
+
+  notifier.busy("parent")
+  await notifier.idle("parent", true, "complete:claim-after-restart")
+  expect(parentDone()).toBe(1)
+})
+
+test("grandchild creation invalidates an in-flight grandparent completion", async () => {
+  const gate = strictTerminalWithBlockedClaim()
+  await notifier.created("child1", "parent", null)
+  await notifier.idle("child1")
+  notifier.busy("parent")
+  const oldCompletion = notifier.idle("parent", true, "complete:claim-grandchild")
+  await gate.entered
+  await notifier.created("child2", "child1", null)
+  gate.release()
+  await oldCompletion
+  expect(parentDone()).toBe(0)
+  await notifier.idle("child2")
+  notifier.busy("parent")
+  await notifier.idle("parent", true, "complete:claim-after-grandchild")
+  expect(parentDone()).toBe(1)
+})
+
+test("duplicate child creation does not cancel a valid parent completion", async () => {
+  const gate = strictTerminalWithBlockedClaim()
+  await notifier.created("child1", "parent", null)
+  await notifier.idle("child1")
+  notifier.busy("parent")
+  const completion = notifier.idle("parent", true, "complete:claim-replay-child")
+  await gate.entered
+  await notifier.created("child1", "parent", null)
+  gate.release()
+  await completion
+  expect(parentDone()).toBe(1)
+})

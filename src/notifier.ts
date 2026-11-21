@@ -136,11 +136,30 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     await handleEvent(current, event, project, elapsed, sessionTitle, sessionID, agentName ?? extractAgentNameFromSessionTitle(sessionTitle), hooks.focusSession)
   }
 
+  // A new child can start after a parent has checked Job/inbox state but
+  // before its notification delivery claim settles. In strict V2 mode,
+  // invalidate all known ancestors so that in-flight completion cannot pass
+  // the final sequence check, even if the child finishes very quickly.
+  function invalidateAncestors(sessionID: string) {
+    if (!(access.waitForParentResume || access.hasOutstandingWork) || !config().deferCompleteUntilChildrenIdle) return
+    const seen = new Set<string>([sessionID])
+    let ancestor = parents.get(sessionID)
+    while (ancestor && !seen.has(ancestor)) {
+      seen.add(ancestor)
+      invalidate(ancestor)
+      ancestor = parents.get(ancestor)
+    }
+  }
+
   function track(sessionID: string, parentID?: string | null) {
     touched.set(sessionID, Date.now())
     if (parentID) {
+      const previous = parents.get(sessionID)
       children.add(sessionID)
       parents.set(sessionID, parentID)
+      // Ignore duplicate creation events; they are common when the V2 TUI
+      // tracks a child synchronously and later processes the queued event.
+      if (previous !== parentID) invalidateAncestors(sessionID)
       // A session can be running before its parent is known.
       holdGrace()
     }
@@ -253,6 +272,9 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       invalidate(id)
       errors.delete(id)
       running.add(id)
+      // An existing child may start a new round after its parent has already
+      // passed the background Job check. Cancel that parent's in-flight alert.
+      invalidateAncestors(id)
       holdGrace()
     },
     async idle(id: string | null, immediate = true, key?: string) {

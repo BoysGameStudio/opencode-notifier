@@ -91,7 +91,7 @@ for (const terminal of ["session.deleted", "session.execution.failed", "session.
     let entered = false
     let resolveJob!: (value: readonly { kind: string; status: string }[]) => void
     const blocked = new Promise<readonly { kind: string; status: string }[]>(resolve => { resolveJob = resolve })
-    const client = await harness(terminal.replace(/\\W/g, "-"), async () => {
+    const client = await harness(terminal.replace(/\W/g, "-"), async () => {
       entered = true
       return blocked
     })
