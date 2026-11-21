@@ -1,6 +1,5 @@
 import { afterAll, expect, test } from "bun:test"
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs"
-import { createHash } from "crypto"
+import { mkdtempSync, rmSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 import type { OpenCodeEvent } from "@opencode/client"
@@ -26,7 +25,9 @@ async function exerciseRace(options: {
     notificationSystem: "ghostty",
     sound: false,
     events: { client_connected: false, subagent_complete: false },
-    messages: { complete: "RACE_DONE" },
+    // Ghostty notification delivery also deduplicates by message text. Each
+    // scenario needs its own message, just as its host events need unique IDs.
+    messages: { complete: `RACE_DONE_${options.stall}_${options.foreignStart ? "foreign" : "local"}` },
   }))
   const previous = process.env.OPENCODE_NOTIFIER_CONFIG_PATH
   process.env.OPENCODE_NOTIFIER_CONFIG_PATH = configPath
@@ -102,12 +103,8 @@ async function exerciseRace(options: {
       emit("final-complete", "session.execution.succeeded", location)
     }
     for (let attempt = 0; attempt < 300 && !writes.some(write => write.includes("RACE_DONE")); attempt++) await Bun.sleep(5)
-    const eventID = `${options.stall}:${options.foreignStart ? "foreign" : "local"}:${options.foreignStart ? "old-complete" : "final-complete"}`
-    const claimKey = `${location.directory}\0complete:${eventID}`
-    const claimPath = join(tmpdir(), `opencode-notifier-${process.getuid?.() ?? "claims"}`,
-      createHash("sha256").update(claimKey).digest("hex"))
     expect(writes.some(write => write.includes("RACE_DONE")),
-      `Final completion was not notified: ${trace.join(", ")}; claimed=${existsSync(claimPath)}; output=${writes.join("").slice(0,300)}`).toBe(true)
+      `Final completion was not notified: ${trace.join(", ")}; output=${writes.join("").slice(0,300)}`).toBe(true)
     await Bun.sleep(40)
     expect(writes.filter(write => write.includes("RACE_DONE")).length).toBe(1)
   } finally {
