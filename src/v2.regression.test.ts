@@ -347,6 +347,7 @@ async function exercise(events: OpenCodeEvent[], options: {
   authoritative?: {
     jobs?: readonly object[]
     readActive?: () => readonly string[]
+    lastSettled?: (sessionID: string) => number | undefined
     inbox?: readonly InboxItem[]
     readInbox?: (sessionID: string) => readonly InboxItem[]
     listChildren?: (parentID: string, cursor?: string) => {
@@ -380,11 +381,11 @@ async function exercise(events: OpenCodeEvent[], options: {
   const { readActive, listChildren } = options.authoritative ?? {}
   const notifier = createV2Notifier({
     session: {
-      get: async () => {
+      get: async ({ sessionID }: { sessionID: string }) => {
         options.onGet?.()
         if (options.hangOwnership) return new Promise<never>(() => {})
         if (options.missing) throw new Error("Session not found")
-        return { id: "session", title: "test", location: options.sessionLocation, ...(options.child ? { parentID: "parent", agent: options.agentName } : {}) }
+        return { id: "session", title: "test", location: options.sessionLocation, time: { idle: options.authoritative?.lastSettled?.(sessionID) }, ...(options.child ? { parentID: "parent", agent: options.agentName } : {}) }
       },
       context: async () => [{ id: "message", type: "user", text: "hello", time: { created: Date.now() - (options.messageAge ?? 1000) } } satisfies SessionMessageUser],
       ...(readActive ? {
@@ -658,6 +659,42 @@ test("V2 rechecks activity if a descendant can take its report during the inbox 
     },
   })
   expect(output).toHaveLength(0)
+})
+
+test("V2 holds completion if a descendant finishes processing entirely between activity snapshots", async () => {
+  let middleIdle = 90
+  const report = { type: "synthetic", payload: { metadata: { source: "subagent" } } }
+  let ownReports: readonly InboxItem[] = []
+  const output = await exercise([
+    { ...event("session.execution.succeeded", { sessionID: "root" }), created: 100 },
+  ], {
+    deferChildren: true,
+    authoritative: {
+      readActive: () => [],
+      listChildren: parentID => ({ data: parentID === "root" ? [{ id: "middle", parentID }] : [] }),
+      lastSettled: sessionID => sessionID === "middle" ? middleIdle : 100,
+      readInbox: sessionID => {
+        if (sessionID === "root") return ownReports
+        middleIdle = 110
+        ownReports = [report]
+        return []
+      },
+    },
+  })
+  expect(output).toHaveLength(0)
+})
+
+test("V2 waits for a later root success when the child and root settle in the same millisecond", async () => {
+  const options = {
+    deferChildren: true,
+    authoritative: {
+      listChildren: (parentID: string) => ({ data: parentID === "root" ? [{ id: "child", parentID }] : [] }),
+      lastSettled: (sessionID: string) => sessionID === "child" ? 100 : undefined,
+    },
+  }
+  const success = (created: number) => ({ ...event("session.execution.succeeded", { sessionID: "root" }), created })
+  expect(await exercise([success(100)], options)).toHaveLength(0)
+  expect(await exercise([success(101)], options)).toHaveLength(1)
 })
 
 test("V2 fails closed rather than sending a false completion when Job or inbox API fails", async () => {

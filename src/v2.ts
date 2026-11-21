@@ -93,11 +93,12 @@ type WorkClient = {
 }
 
 async function hasOutstandingSessionWork(
-  session: WorkClient["session"],
+  session: Client["session"] & WorkClient["session"],
   inbox: NonNullable<WorkClient["session"]["inbox"]>,
   root: string,
   active: ReadonlySet<string>,
   signal: AbortSignal,
+  completedAt?: number,
 ) {
   const sessions = new Set([root])
   const pending = [root]
@@ -132,10 +133,22 @@ async function hasOutstandingSessionWork(
   }
   // A descendant can consume its inbox after the first activity snapshot.
   // Reuse the discovered family to check for executions that took that work.
-  if (sessions.size === 1 || !session.active) return false
+  if (sessions.size === 1) return false
   signal.throwIfAborted()
-  const current = await session.active({ signal })
-  return Object.keys(current).some(id => id !== root && sessions.has(id))
+  const current = await session.active?.({ signal })
+  if (current && Object.keys(current).some(id => id !== root && sessions.has(id))) return true
+
+  // A fast handoff can start and finish between activity snapshots. OpenCode
+  // records the terminal time before the execution leaves its active set.
+  // Require a later root success when a child settled in or after the same
+  // millisecond, which is the precision of the host's timestamps.
+  if (completedAt === undefined) return false
+  for (let offset = 1; offset < pending.length; offset += batchSize) {
+    signal.throwIfAborted()
+    const descendants = await Promise.all(pending.slice(offset, offset + batchSize).map(sessionID => session.get({ sessionID }, { signal })))
+    if (descendants.some(child => (child.time?.idle ?? -Infinity) >= completedAt)) return true
+  }
+  return false
 }
 
 export function createV2Notifier(client: Client, location: LocationRef, delivery: Delivery, hooks: DeliveryHooks = {}, background?: ReturnType<typeof createBackgroundObserver>) {
@@ -172,7 +185,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     ...(background ? {
       hasObservedOutstandingWork: background.outstanding,
     } : jobs && typeof jobs.list === "function" && inbox && typeof inbox.list === "function" ? {
-      async hasOutstandingWork(sessionID: string) {
+      async hasOutstandingWork(sessionID: string, completedAt?: number) {
         // Job state survives missed session.created events and includes descendants.
         // A finished child can already have been removed from the Job registry
         // while its completion report is still queued for the parent.
@@ -187,7 +200,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           if (records.some(job => job.status === "running" || job.kind === "subagent")) return true
           // Read inboxes after the Job registry. OpenCode moves each report to
           // its immediate parent's inbox before removing it from the outbox.
-          return hasOutstandingSessionWork(work.session, inbox, sessionID, new Set(Object.keys(active ?? {})), signal)
+          return hasOutstandingSessionWork(work.session, inbox, sessionID, new Set(Object.keys(active ?? {})), signal, completedAt)
         })
       },
     } : {}),
@@ -404,7 +417,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
             // was waiting on its session queue or an API lookup.
             if (receipt && (startVersions.get(event.data.sessionID) ?? 0) !== receipt.startVersion) break
             if (receipt?.completionSequence !== undefined && !notifier.completionCurrent(event.data.sessionID, receipt.completionSequence)) break
-            if (first(`complete:${event.id}`)) await notifier.idle(event.data.sessionID, true, `complete:${event.id}`, receipt?.blocked)
+            if (first(`complete:${event.id}`)) await notifier.idle(event.data.sessionID, true, `complete:${event.id}`, receipt?.blocked, event.created)
             forget(event.data.sessionID, receipt)
             break
           case "session.execution.failed":

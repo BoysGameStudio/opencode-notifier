@@ -27,9 +27,9 @@ export interface SessionAccess {
   info(sessionID: string): Promise<SessionInfo>
   elapsed(sessionID: string, now: number): Promise<number | null>
   permissionPending(sessionID: string | null, permissionID: string): Promise<boolean>
-  // V2 TUI: include server-side background Jobs and queued subagent reports.
+  // V2 TUI: inspect work relative to the host's successful execution event.
   // Absent on V1 and on server-only V2 delivery.
-  hasOutstandingWork?(sessionID: string): Promise<boolean>
+  hasOutstandingWork?(sessionID: string, completedAt?: number): Promise<boolean>
   hasObservedOutstandingWork?(sessionID: string): boolean
   // V2 server events know parent/child lifecycle even without the Job API.
   waitForParentResume?: boolean
@@ -228,7 +228,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     }
   }
 
-  async function complete(sessionID: string, sequence: number, now: number, key?: string, blockedAtReceipt = false) {
+  async function complete(sessionID: string, sequence: number, now: number, key?: string, blockedAtReceipt = false, completedAt?: number) {
     if (disposed || sequences.get(sessionID) !== sequence) return
     if (errors.delete(sessionID)) return
     if (children.has(sessionID)) {
@@ -243,7 +243,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     let outstanding = blockedAtReceipt
     if (!outstanding && !info.isChild && current.deferCompleteUntilChildrenIdle && access.hasOutstandingWork) {
       try {
-        outstanding = await access.hasOutstandingWork(sessionID)
+        outstanding = await access.hasOutstandingWork(sessionID, completedAt)
       } catch {
         // Losing the Job/inbox API must not turn uncertainty into a false "complete".
         outstanding = true
@@ -319,7 +319,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       invalidateAncestors(id)
       holdGrace()
     },
-    async idle(id: string | null, immediate = true, key?: string, blockedAtReceipt = false) {
+    async idle(id: string | null, immediate = true, key?: string, blockedAtReceipt = false, completedAt?: number) {
       if (disposed) return
       if (!id) return notify("complete")
       // Its busy would have dropped the alert, so this is a repeated idle. Keep the current wait.
@@ -328,13 +328,13 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       running.delete(id)
       const now = Date.now()
       if (immediate) {
-        await complete(id, sequence, now, key, blockedAtReceipt)
+        await complete(id, sequence, now, key, blockedAtReceipt, completedAt)
         startGrace()
         return
       }
       idleTimers.set(id, setTimeout(() => {
         idleTimers.delete(id)
-        void complete(id, sequence, now, key, blockedAtReceipt).then(startGrace).catch(() => undefined)
+        void complete(id, sequence, now, key, blockedAtReceipt, completedAt).then(startGrace).catch(() => undefined)
       }, IDLE_COMPLETE_DELAY_MS))
     },
     stopped(id: string) {
