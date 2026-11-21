@@ -33,26 +33,43 @@ const setup: Plugin.Definition["setup"] = async (ctx) => {
   }
   let notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
   let disposed = false
-  // Ownership and Job checks are asynchronous, so lifecycle events are still
-  // processed in their arrival order. But execution.started MUST invalidate any
-  // older completion synchronously on receipt, not when it reaches this queue.
-  let eventQueue: Promise<void> = Promise.resolve()
+  // Only events relevant to notifier delivery or lifecycle tracking need an
+  // asynchronous handler. In particular, never queue high-volume text/reasoning
+  // deltas. Each session has a separate serial queue so a hung metadata lookup
+  // cannot block permission or completion alerts for unrelated sessions.
+  const relevant = new Set<string>([
+    "session.created", "session.deleted", "session.moved",
+    "session.execution.started", "session.execution.succeeded",
+    "session.execution.failed", "session.execution.interrupted",
+    "session.inbox.enqueued", "permission.asked", "form.created",
+  ])
+  const queues = new Map<string, Promise<void>>()
   const stop = ctx.data.listen(({ details }) => {
-    if (disposed) return
+    if (disposed || !relevant.has(details.type)) return
+    if (details.type === "session.inbox.enqueued" &&
+        details.data.item.type !== "user" &&
+        !(details.data.item.type === "synthetic" && details.data.item.payload.metadata?.source === "subagent")) return
     const current = ctx.location ?? ctx.data.location.default()
     if (current.directory !== location.directory || current.workspaceID !== location.workspaceID) {
       notifier.dispose()
       location = current
       notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
+      void clients.refresh().catch(() => undefined)
     }
     const target = notifier
     const receipt = target.received(details)
-    eventQueue = eventQueue.then(async () => {
+    const sessionID = details.type === "form.created"
+      ? details.data.form.sessionID
+      : "sessionID" in details.data ? details.data.sessionID : undefined
+    const queueKey = sessionID ?? "__global__"
+    const previous = queues.get(queueKey) ?? Promise.resolve()
+    const task = previous.then(async () => {
       if (disposed) return
-      // Presence refresh is best-effort; a temporary failure must not lose events.
-      try { await clients.refresh() } catch {}
       await target.event(details, receipt)
-    }).catch(() => undefined)
+    }).catch(() => undefined).finally(() => {
+      if (queues.get(queueKey) === task) queues.delete(queueKey)
+    })
+    queues.set(queueKey, task)
   })
   void notifier.connected().catch(() => undefined)
   return () => {
