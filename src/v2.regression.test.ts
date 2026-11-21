@@ -29,6 +29,7 @@ async function exercise(events: OpenCodeEvent[], options: {
   minDuration?: number
   commandMinDuration?: number
   missing?: boolean
+  hangOwnership?: boolean
   child?: boolean
   delivery?: Delivery
   command?: boolean
@@ -69,6 +70,7 @@ async function exercise(events: OpenCodeEvent[], options: {
     session: {
       get: async () => {
         options.onGet?.()
+        if (options.hangOwnership) return new Promise<never>(() => {})
         if (options.missing) throw new Error("Session not found")
         return { id: "session", title: "test", location: options.sessionLocation, ...(options.child ? { parentID: "parent", agent: options.agentName } : {}) }
       },
@@ -352,4 +354,13 @@ test("V2 completion fails closed on an unresolved session location, but question
   const output = await exercise([complete, question], { missing: true })
   expect(output.filter(value => value.includes("PROBE_DONE"))).toHaveLength(0)
   expect(output.filter(value => value.includes("PROBE_QUESTION"))).toHaveLength(1)
+})
+
+test("an unresponsive session ownership API cannot indefinitely block completion handling", async () => {
+  const output = await exercise([
+    event("session.execution.succeeded", { sessionID: "unresponsive" }),
+  ], { hangOwnership: true })
+  // Ownership is unknown, so no speculative "complete" notification. The
+  // adapter must nevertheless settle the event within its bounded deadline.
+  expect(output).toHaveLength(0)
 })
