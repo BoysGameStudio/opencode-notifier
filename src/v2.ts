@@ -414,7 +414,8 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
 type IdleHook = (name: "experimental.idle", observe: (event: { sessionID: string; background: readonly IdleBackground[] }) => void) => Promise<{ dispose(): Promise<void> }>
 
 export const setupV2: Plugin.Plugin["setup"] = async (ctx) => {
-  const background = createBackgroundObserver()
+  const version = ctx.app?.version?.match(/^2\.(\d+)\.\d+$/)
+  const background = createBackgroundObserver({ reportsDirectChildren: !!version && Number(version[1]) >= 3 })
   const notifier = createV2Notifier(ctx, ctx.location, "command", {}, background)
   void notifier.connected().catch(() => undefined)
   const controller = new AbortController()

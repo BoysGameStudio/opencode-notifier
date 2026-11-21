@@ -10,6 +10,10 @@ type Round = {
   inboxID?: string
   resolved: boolean
   observedFor?: Set<string>
+  startSequence?: number
+  assistantStep?: string
+  assistantCompleted?: boolean
+  inferredUntil?: number
 }
 
 const HISTORY_LIMIT = 4096
@@ -22,7 +26,7 @@ const backgroundEvents = new Set<OpenCodeEvent["type"]>([
 // The server context exposes live events and idle snapshots, but no Job or
 // inbox readback. Keep the expectation alive across child settlement and
 // correlate actual inbox delivery by its ID, independently of child activity.
-export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = () => loadConfig().deferredCompleteTimeout } = {}) {
+export function createBackgroundObserver({ reportsDirectChildren = false, now = Date.now, uncertaintyTimeout = () => loadConfig().deferredCompleteTimeout } = {}) {
   const parents = new Map<string, string>()
   const rounds = new Map<string, Round[]>()
   const inputs = new Set<string>()
@@ -43,13 +47,13 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
 
   function rememberParent(child: string, parent: string) {
     if (!parents.has(child) && parents.size >= HISTORY_LIMIT) {
+      const time = now()
       const ancestors = new Set(parents.values())
       const firstCall = new Map<string, number>()
       for (const call of calls.values()) firstCall.set(call.parent, Math.min(firstCall.get(call.parent) ?? Infinity, call.began))
       for (const [id, owner] of parents) {
         const began = firstCall.get(owner) ?? Infinity
-        if (ancestors.has(id) || rounds.get(id)?.some(round => round.ended === undefined || round.ended > began ||
-          (!round.resolved && (round.expected || round.inboxID)))) continue
+        if (ancestors.has(id) || rounds.get(id)?.some(round => round.ended === undefined || round.ended > began || hasPendingResult(round, time))) continue
         parents.delete(id)
         rounds.delete(id)
         break
@@ -72,7 +76,8 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
     const history = rounds.get(child) ?? []
     const round: Round = { started, expected: false, resolved: false }
     if (history.length >= 32) {
-      const retired = history.findIndex(item => item.resolved || (!item.expected && !item.inboxID))
+      const time = now()
+      const retired = history.findIndex(item => item.resolved || (item.ended !== undefined && !hasPendingResult(item, time)))
       if (retired === -1) {
         markUncertain(parent)
         return
@@ -104,8 +109,17 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
     return false
   }
 
+  function hasPendingResult(round: Round, time: number) {
+    return !round.resolved && (round.expected || !!round.inboxID || (round.inferredUntil ?? 0) > time)
+  }
+
   return {
-    accepts(event: OpenCodeEvent) { return backgroundEvents.has(event.type) },
+    accepts(event: OpenCodeEvent) {
+      if (event.type === "session.step.started" || event.type === "session.step.ended") {
+        return reportsDirectChildren && parents.has(event.data.sessionID)
+      }
+      return backgroundEvents.has(event.type)
+    },
     movedAway(sessionID: string) {
       const round = rounds.get(sessionID)?.at(-1)
       // The result still belongs to the parent, although this location may
@@ -139,8 +153,23 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
           const parent = parents.get(id)
           if (!parent) break
           const last = rounds.get(id)?.at(-1)
-          if (last && !last.started && last.ended === undefined) last.started = true
-          else add(id, parent, true)
+          const round = last && !last.started && last.ended === undefined ? last : add(id, parent, true)
+          if (round) {
+            round.started = true
+            round.startSequence = event.durable?.seq
+          }
+          break
+        }
+        case "session.step.started":
+        case "session.step.ended": {
+          if (!reportsDirectChildren) break
+          const round = rounds.get(event.data.sessionID)?.at(-1)
+          if (!round?.started || round.ended !== undefined) break
+          if (round.startSequence !== undefined && event.durable?.seq <= round.startSequence) break
+          if (event.type === "session.step.started") round.assistantStep = event.data.assistantMessageID
+          else if (round.assistantStep === event.data.assistantMessageID && event.data.finish !== "error" && event.data.finish !== "content-filter") {
+            round.assistantCompleted = true
+          }
           break
         }
         case "session.execution.succeeded":
@@ -148,7 +177,15 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
         case "session.execution.interrupted": {
           const child = event.data.sessionID
           const last = rounds.get(child)?.at(-1)
-          if (last && last.ended === undefined) last.ended = at
+          if (!last || last.ended !== undefined) break
+          last.ended = at
+          // OpenCode 2.3 reports direct child turns too. Automation children
+          // run quietly, and successful control-only turns produce no report.
+          const expectsReport = event.type === "session.execution.succeeded" ? last.assistantCompleted
+            : event.type === "session.execution.failed" || event.data.reason !== "shutdown"
+          if (reportsDirectChildren && last.started && !child.startsWith("ses_aut_") && expectsReport && !last.expected) {
+            last.inferredUntil = now() + uncertaintyTimeout()
+          }
           break
         }
         case "session.tool.input.started": {
@@ -187,7 +224,7 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
           if (!rememberParent(child, sessionID)) break
           // Child settlement precedes its report. Use the oldest unmatched
           // settlement, so an older report cannot release a later execution.
-          const round = history?.find(item => item.expected && item.ended !== undefined && !item.inboxID)
+          const round = history?.find(item => !item.resolved && (item.expected || item.inferredUntil !== undefined) && item.ended !== undefined && !item.inboxID)
             ?? history?.filter(item => item.ended !== undefined && !item.inboxID).at(-1)
             ?? history?.find(item => item.expected && !item.started && !item.inboxID)
             ?? add(child, sessionID, false)
@@ -214,28 +251,29 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
           for (const [child, history] of rounds) {
             if (child !== id && parents.get(child) !== id) continue
             for (const round of history) {
+              // Removing the child does not remove a report already admitted
+              // to a different, still-existing parent's inbox.
+              const queued = round.inboxID ? inbox.get(round.inboxID) : undefined
+              if (queued && queued.parent !== id) continue
+              round.ended ??= at
               round.resolved = true
               if (round.inboxID) inbox.delete(round.inboxID)
             }
           }
           for (const [key, call] of calls) if (call.parent === id) calls.delete(key)
           for (const key of inputs) if (key.startsWith(`${id}\0`)) inputs.delete(key)
-          if (!parents.has(id)) {
-            for (const [child] of parents) {
-              if (belongsTo(child, id) && !(rounds.get(child)?.some(round => round.expected && !round.resolved))) rounds.delete(child)
-            }
-          }
           break
         }
       }
     },
     outstanding(sessionID: string) {
-      pruneUncertainty(now())
+      const time = now()
+      pruneUncertainty(time)
       for (const owner of uncertainUntil.keys()) if (belongsTo(owner, sessionID)) return true
       for (const call of calls.values()) if (belongsTo(call.parent, sessionID)) return true
       for (const [child, history] of rounds) {
         const parent = parents.get(child)
-        if (history.some(round => !round.resolved && (round.expected || round.inboxID) &&
+        if (history.some(round => hasPendingResult(round, time) &&
           (round.observedFor?.has(sessionID) || parent && belongsTo(parent, sessionID)))) return true
       }
       return false

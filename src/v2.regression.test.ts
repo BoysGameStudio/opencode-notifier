@@ -26,6 +26,51 @@ function event(type: string, data: object): OpenCodeEvent {
   return { id: `event-${++eventID}`, type, data } as OpenCodeEvent
 }
 
+test("OpenCode 2.3 direct child answers block completion before their report enters the inbox", () => {
+  let now = 0
+  const background = createBackgroundObserver({ reportsDirectChildren: true, now: () => now, uncertaintyTimeout: () => 100 })
+  const emit = (type: string, sessionID: string, data = {}) => background.event(event(`session.${type}`, { sessionID, ...data }))
+  const childTurn = (id: string, modelRan: boolean) => {
+    emit("created", id, { parentID: "parent" })
+    emit("execution.started", id)
+    if (modelRan) {
+      emit("step.started", id, { assistantMessageID: "assistant" })
+      emit("step.ended", id, { assistantMessageID: "assistant", finish: "stop" })
+    }
+    emit("execution.succeeded", id)
+  }
+  childTurn("control-only", false)
+  childTurn("ses_aut_fixture_1", true)
+  expect(background.outstanding("parent")).toBe(false)
+  childTurn("direct", true)
+  expect(background.outstanding("parent")).toBe(true)
+  const inboxID = "direct-report"
+  emit("inbox.enqueued", "parent", { inboxID, item: { type: "synthetic", payload: { metadata: { source: "subagent", childID: "direct" } } } })
+  expect(background.outstanding("parent")).toBe(true)
+  emit("inbox.delivered", "parent", { inboxID })
+  expect(background.outstanding("parent")).toBe(false)
+
+  childTurn("missing-report", true)
+  expect(background.outstanding("parent")).toBe(true)
+  now = 101
+  expect(background.outstanding("parent")).toBe(false)
+})
+
+test("deleting a child preserves its result already queued in a live parent's inbox", () => {
+  const background = createBackgroundObserver()
+  const emit = (type: string, sessionID: string, data = {}) => background.event(event(`session.${type}`, { sessionID, ...data }))
+  emit("created", "child", { parentID: "parent" })
+  emit("execution.started", "child")
+  background.idle("parent", [{ kind: "subagent", sessionID: "parent", childSessionID: "child" }])
+  emit("execution.succeeded", "child")
+  const inboxID = "queued-before-deletion"
+  emit("inbox.enqueued", "parent", { inboxID, item: { type: "synthetic", payload: { metadata: { source: "subagent", childID: "child" } } } })
+  emit("deleted", "child")
+  expect(background.outstanding("parent")).toBe(true)
+  emit("inbox.delivered", "parent", { inboxID })
+  expect(background.outstanding("parent")).toBe(false)
+})
+
 test("delivery observed before a fast native tool return satisfies that round only", () => {
   const background = createBackgroundObserver()
   const emit = (type: string, sessionID: string, data = {}) => background.event(event(`session.${type}`, { sessionID, ...data }))
