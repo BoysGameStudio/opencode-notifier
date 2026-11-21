@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode/plugin/tui"
 import { captureStartupWindowId } from "./focus"
 import { disposeLinuxNotifications } from "./notify"
-import { createV2Notifier } from "./v2"
+import { createV2Notifier, notificationEvent } from "./v2"
 import { createTerminalClients } from "./terminal-clients"
 
 const setup: Plugin.Definition["setup"] = async (ctx) => {
@@ -33,22 +33,8 @@ const setup: Plugin.Definition["setup"] = async (ctx) => {
   }
   let notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
   let disposed = false
-  // Only events relevant to notifier delivery or lifecycle tracking need an
-  // asynchronous handler. In particular, never queue high-volume text/reasoning
-  // deltas. Each session has a separate serial queue so a hung metadata lookup
-  // cannot block permission or completion alerts for unrelated sessions.
-  const relevant = new Set<string>([
-    "session.created", "session.deleted", "session.moved",
-    "session.execution.started", "session.execution.succeeded",
-    "session.execution.failed", "session.execution.interrupted",
-    "session.inbox.enqueued", "permission.asked", "form.created",
-  ])
-  const queues = new Map<string, Promise<void>>()
   const stop = ctx.data.listen(({ details }) => {
-    if (disposed || !relevant.has(details.type)) return
-    if (details.type === "session.inbox.enqueued" &&
-        details.data.item.type !== "user" &&
-        !(details.data.item.type === "synthetic" && details.data.item.payload.metadata?.source === "subagent")) return
+    if (disposed || !notificationEvent(details)) return
     const current = ctx.location ?? ctx.data.location.default()
     if (current.directory !== location.directory || current.workspaceID !== location.workspaceID) {
       notifier.dispose()
@@ -56,20 +42,7 @@ const setup: Plugin.Definition["setup"] = async (ctx) => {
       notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
       void clients.refresh().catch(() => undefined)
     }
-    const target = notifier
-    const receipt = target.received(details)
-    const sessionID = details.type === "form.created"
-      ? details.data.form.sessionID
-      : "sessionID" in details.data ? details.data.sessionID : undefined
-    const queueKey = sessionID ?? "__global__"
-    const previous = queues.get(queueKey) ?? Promise.resolve()
-    const task = previous.then(async () => {
-      if (disposed) return
-      await target.event(details, receipt)
-    }).catch(() => undefined).finally(() => {
-      if (queues.get(queueKey) === task) queues.delete(queueKey)
-    })
-    queues.set(queueKey, task)
+    notifier.enqueue(details)
   })
   void notifier.connected().catch(() => undefined)
   return () => {

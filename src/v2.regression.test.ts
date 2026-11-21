@@ -2,7 +2,8 @@ import { afterAll, test, expect } from "bun:test"
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
-import { createV2Notifier } from "./v2"
+import { createV2Notifier, setupV2, OUTSTANDING_WORK_TIMEOUT_MS } from "./v2"
+import { createBackgroundObserver } from "./v2-background"
 import type { Delivery } from "./notifier"
 import type { OpenCodeEvent, SessionMessageUser } from "@opencode/client"
 import { createDeliveryClaimer } from "./claim"
@@ -24,6 +25,124 @@ function event(type: string, data: object): OpenCodeEvent {
   // The fixtures supply only fields the notifier reads; real event types remain checked in v2.ts.
   return { id: `event-${++eventID}`, type, data } as OpenCodeEvent
 }
+
+test("delivery observed before a fast native tool return satisfies that round only", () => {
+  const background = createBackgroundObserver()
+  const emit = (type: string, sessionID: string, data = {}) => background.event(event(`session.${type}`, { sessionID, ...data }))
+  const invoke = (id: string) => {
+    const tool = { id, assistantMessageID: "m", executed: true }
+    emit("tool.input.started", "parent", { ...tool, name: "subagent" })
+    emit("tool.called", "parent", tool)
+    return () => emit("tool.success", "parent", { ...tool, metadata: { status: "running", sessionID: "child" } })
+  }
+  const first = invoke("first")
+  emit("created", "child", { parentID: "parent" })
+  emit("execution.started", "child")
+  emit("execution.succeeded", "child")
+  const item = { type: "synthetic", payload: { metadata: { source: "subagent", childID: "child" } } }
+  emit("inbox.enqueued", "parent", { inboxID: "report-1", item })
+  emit("inbox.delivered", "parent", { inboxID: "report-1" })
+  expect(background.outstanding("parent")).toBe(true)
+  first()
+  expect(background.outstanding("parent")).toBe(false)
+
+  const second = invoke("second")
+  second()
+  emit("inbox.enqueued", "parent", { inboxID: "report-1", item })
+  emit("inbox.delivered", "parent", { inboxID: "report-1" })
+  expect(background.outstanding("parent")).toBe(true)
+})
+
+test("the server command waits through the outbox gap and a reused child's second round", async () => {
+  const log = join(fixture, "server-rounds.log")
+  const path = join(fixture, "server-rounds.json")
+  writeFileSync(path, JSON.stringify({
+    deferCompleteUntilChildrenIdle: true, notification: false, sound: false, bell: false,
+    command: { enabled: true, path: process.execPath, args: [commandScript, log, "{event}:{sessionID}"] },
+    events: { client_connected: false, session_started: false, subagent_complete: false, user_message: false },
+  }))
+  const previous = process.env.OPENCODE_NOTIFIER_CONFIG_PATH
+  process.env.OPENCODE_NOTIFIER_CONFIG_PATH = path
+  const location = { directory: fixture }
+  const stream = new TransformStream<OpenCodeEvent>()
+  const writer = stream.writable.getWriter()
+  const cleanup = await setupV2({
+    location,
+    session: { get: async ({ sessionID }: { sessionID: string }) => ({ location, title: sessionID, ...(sessionID === "child" ? { parentID: "parent" } : {}) }) },
+    event: { subscribe: () => stream.readable },
+  } as never)
+  const emit = (type: string, sessionID: string, data = {}) => writer.write(event(`session.${type}`, { sessionID, ...data }))
+  const tool = (id: string) => ({ assistantMessageID: "message", id, executed: true })
+  const report = (inboxID: string) => emit("inbox.enqueued", "parent", {
+    inboxID, item: { type: "synthetic", payload: { metadata: { source: "subagent", childID: "child" } } },
+  })
+  const commands = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : []
+  try {
+    await emit("created", "child", { location, parentID: "parent" })
+    await emit("execution.started", "parent")
+    await emit("tool.input.started", "parent", { ...tool("first"), name: "subagent" })
+    await emit("tool.called", "parent", tool("first"))
+    await emit("execution.started", "child")
+    await emit("execution.succeeded", "child")
+    await emit("tool.success", "parent", { ...tool("first"), metadata: { sessionID: "child", status: "running" } })
+    await emit("execution.succeeded", "parent")
+    await Bun.sleep(100)
+    expect(commands()).toEqual([])
+
+    await emit("execution.started", "parent")
+    await emit("tool.input.started", "parent", { ...tool("second"), name: "subagent" })
+    await emit("tool.called", "parent", tool("second"))
+    await emit("execution.started", "child")
+    await report("first-inbox")
+    await emit("inbox.delivered", "parent", { inboxID: "first-inbox" })
+    await emit("tool.success", "parent", { ...tool("second"), metadata: { sessionID: "child", status: "running" } })
+    await emit("execution.succeeded", "child")
+    await emit("execution.succeeded", "parent")
+    await Bun.sleep(100)
+    expect(commands()).toEqual([])
+
+    await report("second-inbox")
+    await emit("execution.started", "parent")
+    await emit("inbox.delivered", "parent", { inboxID: "second-inbox" })
+    await emit("execution.succeeded", "parent")
+    await emit("execution.succeeded", "ordinary")
+    for (let n = 0; n < 100 && commands().length < 2; n++) await Bun.sleep(10)
+    expect(commands().sort()).toEqual(["complete:ordinary", "complete:parent"])
+  } finally {
+    await writer.close()
+    await cleanup?.()
+    if (previous === undefined) delete process.env.OPENCODE_NOTIFIER_CONFIG_PATH
+    else process.env.OPENCODE_NOTIFIER_CONFIG_PATH = previous
+  }
+})
+
+test("a timed-out permission lookup releases subsequent delivery in the same session", async () => {
+  const log = join(fixture, "permission-timeout.log")
+  const path = join(fixture, "permission-timeout.json")
+  writeFileSync(path, JSON.stringify({ command: { enabled: true, path: process.execPath, args: [commandScript, log, "{event}"] } }))
+  const previous = process.env.OPENCODE_NOTIFIER_CONFIG_PATH
+  process.env.OPENCODE_NOTIFIER_CONFIG_PATH = path
+  let query: AbortSignal | undefined
+  const notifier = createV2Notifier({
+    session: { get: async () => ({ title: "test" }) },
+    permission: { list: (_, options) => {
+      query = options?.signal ?? undefined
+      return new Promise(() => {})
+    } },
+  } as never, { directory: fixture }, "command")
+  try {
+    notifier.enqueue(event("permission.asked", { sessionID: "same", id: "permission-timeout" }))
+    notifier.enqueue(event("form.created", { form: { sessionID: "same", id: "after-timeout", metadata: { kind: "question" } } }))
+    const deadline = Date.now() + OUTSTANDING_WORK_TIMEOUT_MS + 1500
+    while (Date.now() < deadline && (!existsSync(log) || readFileSync(log, "utf8").trim().split("\n").length < 2)) await Bun.sleep(20)
+    expect(query?.aborted).toBe(true)
+    expect(readFileSync(log, "utf8").trim().split("\n").sort()).toEqual(["permission", "question"])
+  } finally {
+    notifier.dispose()
+    if (previous === undefined) delete process.env.OPENCODE_NOTIFIER_CONFIG_PATH
+    else process.env.OPENCODE_NOTIFIER_CONFIG_PATH = previous
+  }
+})
 
 async function exercise(events: OpenCodeEvent[], options: {
   minDuration?: number

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode 2 server commands wait for observed background subagent results to reach the parent and for the parent to finish.
+- Queuing more input preserves a running subagent's status, and slow duration or permission queries no longer stall a session's notifications indefinitely.
+
 ## [1.1.3] - 2026-11-14
 
 ### Fixed

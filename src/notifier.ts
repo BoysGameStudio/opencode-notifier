@@ -30,6 +30,7 @@ export interface SessionAccess {
   // V2 TUI: include server-side background Jobs and queued subagent reports.
   // Absent on V1 and on server-only V2 delivery.
   hasOutstandingWork?(sessionID: string): Promise<boolean>
+  hasObservedOutstandingWork?(sessionID: string): boolean
   // V2 server events know parent/child lifecycle even without the Job API.
   waitForParentResume?: boolean
 }
@@ -226,11 +227,11 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     }
   }
 
-  async function complete(sessionID: string, sequence: number, now: number, key?: string) {
+  async function complete(sessionID: string, sequence: number, now: number, key?: string, blockedAtReceipt = false) {
     if (disposed || sequences.get(sessionID) !== sequence) return
     if (errors.delete(sessionID)) return
     if (children.has(sessionID)) {
-      await notify("subagent_complete", sessionID, { now, key })
+      await notify("subagent_complete", sessionID, { now, key, valid: () => sequences.get(sessionID) === sequence })
       return
     }
     const info = await access.info(sessionID)
@@ -238,8 +239,8 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     if (info.isChild === null) return
     if (info.isChild) children.add(sessionID)
     const current = config()
-    let outstanding = false
-    if (!info.isChild && current.deferCompleteUntilChildrenIdle && access.hasOutstandingWork) {
+    let outstanding = blockedAtReceipt
+    if (!outstanding && !info.isChild && current.deferCompleteUntilChildrenIdle && access.hasOutstandingWork) {
       try {
         outstanding = await access.hasOutstandingWork(sessionID)
       } catch {
@@ -249,7 +250,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     }
     // A parent may resume while metadata or outstanding work is being queried.
     if (disposed || sequences.get(sessionID) !== sequence) return
-    if (!info.isChild && current.deferCompleteUntilChildrenIdle && (hasRunningChildren(sessionID) || outstanding)) {
+    if (!info.isChild && current.deferCompleteUntilChildrenIdle && (hasRunningChildren(sessionID) || outstanding || access.hasObservedOutstandingWork?.(sessionID))) {
       // Expiry drops the pending alert; it must not claim completion while work is still active.
       const timer = setTimeout(() => drop(sessionID), current.deferredCompleteTimeout)
       timer.unref()
@@ -259,7 +260,8 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     await notify(info.isChild ? "subagent_complete" : "complete", sessionID, {
       title: info.title, now, key,
       // Lookups and delivery claims can race with the next execution.started event.
-      valid: () => sequences.get(sessionID) === sequence,
+      valid: () => sequences.get(sessionID) === sequence &&
+        (info.isChild || !current.deferCompleteUntilChildrenIdle || !access.hasObservedOutstandingWork?.(sessionID)),
     })
   }
 
@@ -284,6 +286,10 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
   return {
     notify,
     track,
+    invalidate,
+    settled(id: string) {
+      running.delete(id)
+    },
     async created(id: string | null, parentID: string | null, title: string | null, key?: string) {
       if (id) track(id, parentID)
       if (id && parentID) {
@@ -307,7 +313,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       invalidateAncestors(id)
       holdGrace()
     },
-    async idle(id: string | null, immediate = true, key?: string) {
+    async idle(id: string | null, immediate = true, key?: string, blockedAtReceipt = false) {
       if (disposed) return
       if (!id) return notify("complete")
       // Its busy would have dropped the alert, so this is a repeated idle. Keep the current wait.
@@ -316,13 +322,13 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       running.delete(id)
       const now = Date.now()
       if (immediate) {
-        await complete(id, sequence, now, key)
+        await complete(id, sequence, now, key, blockedAtReceipt)
         startGrace()
         return
       }
       idleTimers.set(id, setTimeout(() => {
         idleTimers.delete(id)
-        void complete(id, sequence, now, key).then(startGrace).catch(() => undefined)
+        void complete(id, sequence, now, key, blockedAtReceipt).then(startGrace).catch(() => undefined)
       }, IDLE_COMPLETE_DELAY_MS))
     },
     stopped(id: string) {

@@ -86,6 +86,24 @@ async function harness(
   }
 }
 
+test("queueing input for a running child does not release its parent's completion", async () => {
+  const client = await harness("queued-child-input", async () => [])
+  try {
+    client.emit("session.created", "child", { location: { directory: root }, parentID: "parent" })
+    client.emit("session.execution.started", "child")
+    client.emit("session.inbox.enqueued", "child", { inboxID: "more-input", item: { type: "user", payload: { text: "keep working" } } })
+    client.emit("session.execution.succeeded", "parent")
+    await Bun.sleep(120)
+    expect(client.writes.some(write => write.includes("LIFECYCLE_queued-child-input"))).toBe(false)
+    client.emit("session.execution.succeeded", "child")
+    client.emit("session.execution.started", "parent")
+    client.emit("session.execution.succeeded", "parent")
+    await until(() => client.writes.some(write => write.includes("LIFECYCLE_queued-child-input parent")), "Final parent completion did not arrive")
+  } finally {
+    await client.close()
+  }
+})
+
 for (const terminal of ["session.deleted", "session.execution.failed", "session.execution.interrupted"]) {
   test(`a ${terminal} received while Job lookup is pending invalidates stale completion`, async () => {
     let entered = false

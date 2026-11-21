@@ -3,6 +3,8 @@ import type { LocationRef, OpenCodeEvent } from "@opencode/client"
 import { debugFocusState as debug } from "./focus"
 import { createNotifier } from "./notifier"
 import type { Delivery, DeliveryHooks } from "./notifier"
+import { createBackgroundObserver } from "./v2-background"
+import type { IdleBackground } from "./v2-background"
 
 type Client = {
   session: Pick<Plugin.Context["session"], "get" | "context">
@@ -15,7 +17,7 @@ type Client = {
 type EventReceipt = {
   startVersion: number
   startedEarly: boolean
-  stoppedEarly?: boolean
+  blocked?: boolean
   ignored?: boolean
 }
 
@@ -23,7 +25,7 @@ type EventReceipt = {
 // notifier retains its pending completion rather than guessing "finished".
 export const OUTSTANDING_WORK_TIMEOUT_MS = 2500
 
-async function boundedWorkQuery<T>(query: (signal: AbortSignal) => Promise<T>): Promise<T> {
+async function boundedQuery<T>(query: (signal: AbortSignal) => Promise<T>): Promise<T> {
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
@@ -32,13 +34,28 @@ async function boundedWorkQuery<T>(query: (signal: AbortSignal) => Promise<T>): 
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           controller.abort()
-          reject(new Error("OpenCode background-work query timed out"))
+          reject(new Error("OpenCode notifier query timed out"))
         }, OUTSTANDING_WORK_TIMEOUT_MS)
         timer.unref()
       }),
     ])
   } finally {
     if (timer) clearTimeout(timer)
+  }
+}
+
+// Filter out token deltas and other events unrelated to notification delivery.
+export function notificationEvent(event: OpenCodeEvent) {
+  switch (event.type) {
+    case "session.created": case "session.deleted": case "session.moved":
+    case "session.execution.started": case "session.execution.succeeded":
+    case "session.execution.failed": case "session.execution.interrupted":
+    case "permission.asked": case "form.created":
+      return true
+    case "session.inbox.enqueued":
+      return event.data.item.type === "user" || (event.data.item.type === "synthetic" && event.data.item.payload.metadata?.source === "subagent")
+    default:
+      return false
   }
 }
 
@@ -66,14 +83,14 @@ type WorkClient = {
   }
 }
 
-export function createV2Notifier(client: Client, location: LocationRef, delivery: Delivery, hooks: DeliveryHooks = {}) {
+export function createV2Notifier(client: Client, location: LocationRef, delivery: Delivery, hooks: DeliveryHooks = {}, background?: ReturnType<typeof createBackgroundObserver>) {
   const work = client as Client & WorkClient
   const jobs = work.experimental?.job
   const inbox = work.session?.inbox
   const notifier = createNotifier({
     async info(sessionID) {
       try {
-        const session = await boundedWorkQuery(signal => client.session.get({ sessionID }, { signal }))
+        const session = await boundedQuery(signal => client.session.get({ sessionID }, { signal }))
         return { isChild: !!session.parentID, title: session.title ?? null, agentName: session.parentID ? session.agent ?? null : null }
       } catch {
         return { isChild: null, title: null }
@@ -81,7 +98,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     },
     async elapsed(sessionID, now) {
       try {
-        const messages = await client.session.context({ sessionID })
+        const messages = await boundedQuery(signal => client.session.context({ sessionID }, { signal }))
         const times = messages.flatMap(message => message.type === "user" ? [message.time.created] : [])
         return times.length ? (now - Math.max(...times)) / 1000 : null
       } catch {
@@ -91,18 +108,20 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     async permissionPending(sessionID, permissionID) {
       if (!sessionID) return true
       try {
-        return (await client.permission.list({ sessionID })).some(request => request.id === permissionID)
+        return (await boundedQuery(signal => client.permission.list({ sessionID }, { signal }))).some(request => request.id === permissionID)
       } catch {
         return true
       }
     },
     waitForParentResume: true,
-    ...(jobs && typeof jobs.list === "function" && inbox && typeof inbox.list === "function" ? {
+    ...(background ? {
+      hasObservedOutstandingWork: background.outstanding,
+    } : jobs && typeof jobs.list === "function" && inbox && typeof inbox.list === "function" ? {
       async hasOutstandingWork(sessionID: string) {
         // Job state survives missed session.created events and includes descendants.
         // A finished child can already have been removed from the Job registry
         // while its completion report is still queued for the parent.
-        return boundedWorkQuery(async signal => {
+        return boundedQuery(async signal => {
           // The Job registry includes unconsumed terminal Subagent reports in
           // the durable outbox. Filtering to "running" misses the settlement
           // -> inbox-admission gap and causes premature parent completion.
@@ -158,11 +177,11 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
   function ours(sessionID: string) {
     let result = owned.get(sessionID)
     if (!result) {
-      result = boundedWorkQuery(signal => client.session.get({ sessionID }, { signal })).then(
+      result = boundedQuery(signal => client.session.get({ sessionID }, { signal })).then(
         session => !session.location || here(session.location),
         () => {
           debug(`v2 session ${sessionID}: ownership lookup unavailable`)
-          owned.delete(sessionID)
+          if (owned.get(sessionID) === result) owned.delete(sessionID)
           return null
         },
       )
@@ -186,12 +205,9 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     return true
   }
 
-  return {
+  const queues = new Map<string, Promise<void>>()
+  const adapter = {
     connected: () => notifier.notify("client_connected"),
-    // TUI uses this in the synchronous data.listen callback, before enqueuing
-    // async processing. An early busy invalidates an in-flight completion and
-    // drops pending alerts immediately; the version also rejects a succeeded
-    // event that has not reached notifier.idle() yet.
     received(event: OpenCodeEvent): EventReceipt | undefined {
       if (disposed || (event.location && !here(event.location))) return
       if (event.type === "session.created" && event.data.parentID) {
@@ -213,8 +229,8 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
         if (!first(`receipt:${event.id}`))
           return { startVersion: startVersions.get(event.data.sessionID) ?? 0, startedEarly: false, ignored: true }
         const startVersion = advance(event.data.sessionID)
-        notifier.stopped(event.data.sessionID)
-        return { startVersion, startedEarly: false, stoppedEarly: true }
+        notifier.invalidate(event.data.sessionID)
+        return { startVersion, startedEarly: false }
       }
       if (event.type !== "session.execution.started" &&
           event.type !== "session.execution.succeeded" &&
@@ -230,14 +246,31 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
         notifier.busy(sessionID)
         return { startVersion, startedEarly: true }
       }
-      if (event.type !== "session.execution.succeeded") {
-        // Failed, interrupted and deleted sessions must also invalidate an
-        // older in-flight completion immediately, not after a queue backlog.
-        const startVersion = advance(sessionID)
-        notifier.stopped(sessionID)
-        return { startVersion, startedEarly: false, stoppedEarly: true }
+      if (event.type === "session.execution.succeeded") {
+        notifier.settled(sessionID)
+        // Inbox delivery that arrives later must not retroactively make an old
+        // success eligible for notification.
+        return { startVersion: startVersions.get(sessionID) ?? 0, startedEarly: false, blocked: background?.outstanding(sessionID) }
       }
-      return { startVersion: startVersions.get(sessionID) ?? 0, startedEarly: false }
+      // Failed, interrupted, moved and deleted sessions invalidate completions
+      // before the asynchronous queue reaches them.
+      const startVersion = advance(sessionID)
+      if (event.type === "session.moved") notifier.invalidate(sessionID)
+      else notifier.stopped(sessionID)
+      return { startVersion, startedEarly: false }
+    },
+    enqueue(event: OpenCodeEvent) {
+      if (disposed) return
+      const placement = event.type === "session.created" ? event.data.location ?? event.location : event.location
+      if (background?.accepts(event) && (!placement || here(placement)) && first(`background:${event.id}`)) background.event(event)
+      if (!notificationEvent(event)) return
+      const receipt = adapter.received(event)
+      if (receipt?.ignored) return
+      const key = event.type === "form.created" ? event.data.form.sessionID : "sessionID" in event.data ? event.data.sessionID : undefined
+      const task = (queues.get(key ?? "") ?? Promise.resolve()).then(() => adapter.event(event, receipt)).finally(() => {
+        if (queues.get(key ?? "") === task) queues.delete(key ?? "")
+      })
+      queues.set(key ?? "", task)
     },
     async event(event: OpenCodeEvent, receipt?: EventReceipt) {
       try {
@@ -272,15 +305,13 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
             }
             break
           case "session.execution.started":
-            // The TUI applied busy() at receipt time; the server adapter has no
-            // receipt and continues to process its events normally.
             if (!receipt?.startedEarly) notifier.busy(event.data.sessionID)
             break
           case "session.execution.succeeded":
             // A later start/stop may already be received while this completion
             // was waiting on its session queue or an API lookup.
             if (receipt && (startVersions.get(event.data.sessionID) ?? 0) !== receipt.startVersion) break
-            if (first(`complete:${event.id}`)) await notifier.idle(event.data.sessionID, true, `complete:${event.id}`)
+            if (first(`complete:${event.id}`)) await notifier.idle(event.data.sessionID, true, `complete:${event.id}`, receipt?.blocked)
             forget(event.data.sessionID, receipt)
             break
           case "session.execution.failed":
@@ -336,27 +367,46 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
       seen.clear()
       owned.clear()
       startVersions.clear()
+      queues.clear()
     },
   }
+  return adapter
 }
 
-export const setupV2: Plugin.Plugin["setup"] = (ctx) => {
-  const notifier = createV2Notifier(ctx, ctx.location, "command")
+type IdleHook = (name: "experimental.idle", observe: (event: { sessionID: string; background: readonly IdleBackground[] }) => void) => Promise<{ dispose(): Promise<void> }>
+
+export const setupV2: Plugin.Plugin["setup"] = async (ctx) => {
+  const background = createBackgroundObserver()
+  const notifier = createV2Notifier(ctx, ctx.location, "command", {}, background)
   void notifier.connected().catch(() => undefined)
   const controller = new AbortController()
   // This subscription also serves headless clients. Terminal delivery lives in ./tui.
   const task = (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-        await notifier.event(event)
+        try { notifier.enqueue(event) } catch { /* An event must not close the subscription. */ }
       }
     } catch {
       // Aborting or losing a subscription must not cause an unhandled rejection.
     }
   })()
+  let registration: Awaited<ReturnType<IdleHook>> | undefined
+  try {
+    // The pinned SDK predates this hook. Older hosts still supply the lifecycle
+    // events, while current hosts can also report already-running subagents.
+    const session = ctx.session as (Client["session"] & { hook?: IdleHook }) | undefined
+    registration = await session?.hook?.("experimental.idle", event => {
+      try {
+        if (!controller.signal.aborted && Array.isArray(event.background)) background.idle(event.sessionID, event.background)
+      } catch { /* The observer must not interrupt model execution. */ }
+    })
+  } catch {
+    debug("v2 experimental.idle hook unavailable")
+  }
   return async () => {
     notifier.dispose()
     controller.abort()
+    await registration?.dispose().catch(() => undefined)
     await task
   }
 }
