@@ -9,6 +9,14 @@ type Client = {
   permission: Pick<Plugin.Context["permission"], "list">
 }
 
+// A receipt is captured synchronously, before TUI event handling waits on
+// ownership, Job, inbox, or delivery APIs. It protects completion from a later
+// execution.started event even if the earlier completion has not reached idle().
+type EventReceipt = {
+  startVersion: number
+  startedEarly: boolean
+}
+
 // These APIs are present on a V2 TUI OpenCodeClient (2.3.x), but not on the
 // server's Plugin.Context. Keep them optional for older clients/hosts.
 type WorkClient = {
@@ -75,6 +83,8 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
   }, location.directory, delivery, hooks)
   const seen = new Set<string>()
   const owned = new Map<string, Promise<boolean>>()
+  const startVersions = new Map<string, number>()
+  let nextStartVersion = 0
   let disposed = false
 
   function here(other: { directory: string; workspaceID?: string }) {
@@ -116,7 +126,24 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
 
   return {
     connected: () => notifier.notify("client_connected"),
-    async event(event: OpenCodeEvent) {
+    // TUI uses this in the synchronous data.listen callback, before enqueuing
+    // async processing. An early busy invalidates an in-flight completion and
+    // drops pending alerts immediately; the version also rejects a succeeded
+    // event that has not reached notifier.idle() yet.
+    received(event: OpenCodeEvent): EventReceipt | undefined {
+      if (disposed) return
+      if (event.type !== "session.execution.started" && event.type !== "session.execution.succeeded") return
+      if (event.location && !here(event.location)) return
+      const sessionID = event.data.sessionID
+      if (event.type === "session.execution.started") {
+        const startVersion = ++nextStartVersion
+        startVersions.set(sessionID, startVersion)
+        notifier.busy(sessionID)
+        return { startVersion, startedEarly: true }
+      }
+      return { startVersion: startVersions.get(sessionID) ?? 0, startedEarly: false }
+    },
+    async event(event: OpenCodeEvent, receipt?: EventReceipt) {
       try {
         if (disposed) return
         const sessionID = event.type === "form.created" ? event.data.form.sessionID : "sessionID" in event.data ? event.data.sessionID : undefined
@@ -138,9 +165,14 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
             }
             break
           case "session.execution.started":
-            notifier.busy(event.data.sessionID)
+            // The TUI applied busy() at receipt time; the server adapter has no
+            // receipt and continues to process its events normally.
+            if (!receipt?.startedEarly) notifier.busy(event.data.sessionID)
             break
           case "session.execution.succeeded":
+            // A later start may already be received while this older succeeded
+            // event was waiting on the queue or a session-ownership lookup.
+            if (receipt && (startVersions.get(event.data.sessionID) ?? 0) !== receipt.startVersion) break
             if (first(`complete:${event.id}`)) await notifier.idle(event.data.sessionID, true, `complete:${event.id}`)
             break
           case "session.execution.failed":
@@ -181,6 +213,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
       notifier.dispose()
       seen.clear()
       owned.clear()
+      startVersions.clear()
     },
   }
 }

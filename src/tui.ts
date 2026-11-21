@@ -33,22 +33,25 @@ const setup: Plugin.Definition["setup"] = async (ctx) => {
   }
   let notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
   let disposed = false
-  // Session ownership lookups are async. Without an ordered queue, a later
-  // parent completion can overtake an earlier child creation/busy event.
+  // Ownership and Job checks are asynchronous, so lifecycle events are still
+  // processed in their arrival order. But execution.started MUST invalidate any
+  // older completion synchronously on receipt, not when it reaches this queue.
   let eventQueue: Promise<void> = Promise.resolve()
   const stop = ctx.data.listen(({ details }) => {
     if (disposed) return
     const current = ctx.location ?? ctx.data.location.default()
+    if (current.directory !== location.directory || current.workspaceID !== location.workspaceID) {
+      notifier.dispose()
+      location = current
+      notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
+    }
+    const target = notifier
+    const receipt = target.received(details)
     eventQueue = eventQueue.then(async () => {
       if (disposed) return
       // Presence refresh is best-effort; a temporary failure must not lose events.
       try { await clients.refresh() } catch {}
-      if (current.directory !== location.directory || current.workspaceID !== location.workspaceID) {
-        notifier.dispose()
-        location = current
-        notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
-      }
-      await notifier.event(details)
+      await target.event(details, receipt)
     }).catch(() => undefined)
   })
   void notifier.connected().catch(() => undefined)
