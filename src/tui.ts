@@ -33,16 +33,22 @@ const setup: Plugin.Definition["setup"] = async (ctx) => {
   }
   let notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
   let disposed = false
+  // Session ownership lookups are async. Without an ordered queue, a later
+  // parent completion can overtake an earlier child creation/busy event.
+  let eventQueue: Promise<void> = Promise.resolve()
   const stop = ctx.data.listen(({ details }) => {
     if (disposed) return
-    void clients.refresh()
     const current = ctx.location ?? ctx.data.location.default()
-    if (current.directory !== location.directory || current.workspaceID !== location.workspaceID) {
-      notifier.dispose()
-      location = current
-      notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
-    }
-    void notifier.event(details)
+    eventQueue = eventQueue.then(async () => {
+      if (disposed) return
+      await clients.refresh()
+      if (current.directory !== location.directory || current.workspaceID !== location.workspaceID) {
+        notifier.dispose()
+        location = current
+        notifier = createV2Notifier(ctx.client, location, "terminal", hooks)
+      }
+      await notifier.event(details)
+    }).catch(() => undefined)
   })
   void notifier.connected().catch(() => undefined)
   return () => {

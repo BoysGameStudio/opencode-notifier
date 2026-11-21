@@ -229,3 +229,115 @@ test("expiry during grace delivery lookups drops the alert", async () => {
   await release()
   expect(parentDone()).toBe(0)
 })
+
+function useAuthoritativeWork(check: () => Promise<boolean>) {
+  notifier.dispose()
+  notifier = createNotifier({
+    info: async id => ({ isChild: id.startsWith("child"), title: id }),
+    elapsed: async () => null,
+    permissionPending: async () => true,
+    hasOutstandingWork: async () => check(),
+  }, directory)
+}
+
+test("V2 strict mode does not notify during a slow parent resume, even after the old 2s grace", async () => {
+  jest.useFakeTimers()
+  let background = true
+  useAuthoritativeWork(async () => background)
+  notifier.busy("parent")
+  await notifier.created("child1", "parent", null)
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(0)
+  background = false
+  await notifier.idle("child1")
+  await advance(CHILDREN_SETTLE_MS * 5)
+  expect(parentDone()).toBe(0)
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(1)
+})
+
+test("V2 strict mode defers multiple subagent waves until the final parent turn", async () => {
+  jest.useFakeTimers()
+  let background = true
+  useAuthoritativeWork(async () => background)
+  notifier.busy("parent")
+  await notifier.created("child1", "parent", null)
+  await notifier.idle("parent")
+  background = false
+  await notifier.idle("child1")
+  await advance(CHILDREN_SETTLE_MS * 3)
+  expect(parentDone()).toBe(0)
+  notifier.busy("parent")
+  background = true
+  await notifier.created("child2", "parent", null)
+  await notifier.idle("parent")
+  background = false
+  await notifier.idle("child2")
+  await advance(CHILDREN_SETTLE_MS * 3)
+  expect(parentDone()).toBe(0)
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(1)
+})
+
+test("V2 strict mode also defers a background job whose child creation event was missed", async () => {
+  jest.useFakeTimers()
+  let background = true
+  useAuthoritativeWork(async () => background)
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(0)
+  background = false
+  await advance(CHILDREN_SETTLE_MS * 4)
+  expect(parentDone()).toBe(0)
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(1)
+})
+
+test("V2 strict mode treats failed Job queries as unknown, never as completed", async () => {
+  jest.useFakeTimers()
+  let broken = true
+  useAuthoritativeWork(async () => {
+    if (broken) throw new Error("Job API unavailable")
+    return false
+  })
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  await advance(CHILDREN_SETTLE_MS * 4)
+  expect(parentDone()).toBe(0)
+  broken = false
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(1)
+})
+
+test("V2 strict mode ignores an old completion if the parent resumes during Job lookup", async () => {
+  jest.useFakeTimers()
+  let reached = false
+  let unblock: (active: boolean) => void = () => { throw new Error("not reached") }
+  useAuthoritativeWork(() => new Promise(resolve => {
+    reached = true
+    unblock = resolve
+  }))
+  notifier.busy("parent")
+  const oldComplete = notifier.idle("parent")
+  for (let i = 0; i < 20 && !reached; i++) await Promise.resolve()
+  expect(reached).toBe(true)
+  notifier.busy("parent")
+  unblock(true)
+  await oldComplete
+  await advance(CHILDREN_SETTLE_MS * 4)
+  expect(parentDone()).toBe(0)
+})
+
+test("V2 strict mode expires a deferred completion instead of guessing after 2s", async () => {
+  jest.useFakeTimers()
+  writeFileSync(configPath, JSON.stringify({ ...config, deferredCompleteTimeout: CHILDREN_SETTLE_MS * 3 }))
+  useAuthoritativeWork(async () => true)
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  await advance(CHILDREN_SETTLE_MS * 4)
+  expect(parentDone()).toBe(0)
+})

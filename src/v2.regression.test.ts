@@ -37,10 +37,18 @@ async function exercise(events: OpenCodeEvent[], options: {
   sessionLocation?: { directory: string; workspaceID?: string }
   onGet?: () => void
   silent?: boolean
+  deferChildren?: boolean
+  authoritative?: {
+    jobs?: readonly object[]
+    inbox?: readonly { type: string; payload?: { metadata?: { source?: string } } }[]
+    fail?: boolean
+    onCheck?: (sessionID: string) => void
+  }
 } = {}) {
   writeFileSync(configPath, JSON.stringify({
     suppressWhenFocused: false, sound: false, bell: false, notificationSystem: "ghostty",
     minDuration: options.minDuration ?? 0,
+    deferCompleteUntilChildrenIdle: options.deferChildren ?? false,
     command: { enabled: options.command ?? false, path: process.execPath, args: [commandScript, commandLog, "{event}"], minDuration: options.commandMinDuration ?? 0 },
     events: { session_started: false, client_connected: false, user_message: { notification: true }, complete: options.silent ? false : { notification: true }, subagent_complete: options.agentName ? { notification: true } : false },
     messages: { user_message: "PROBE_USER {turn}", complete: "PROBE_DONE {turn}", error: "PROBE_ERROR {turn}", question: "PROBE_QUESTION {turn}", subagent_complete: "PROBE_AGENT {agentName} {turn}" },
@@ -63,8 +71,17 @@ async function exercise(events: OpenCodeEvent[], options: {
         return { id: "session", title: "test", location: options.sessionLocation, ...(options.child ? { parentID: "parent", agent: options.agentName } : {}) }
       },
       context: async () => [{ id: "message", type: "user", text: "hello", time: { created: Date.now() - (options.messageAge ?? 1000) } } satisfies SessionMessageUser],
+      ...(options.authoritative ? { inbox: { list: async () => {
+        if (options.authoritative?.fail) throw new Error("inbox failed")
+        return options.authoritative?.inbox ?? []
+      } } } : {}),
     },
     permission: { list: async () => [] },
+    ...(options.authoritative ? { experimental: { job: { list: async ({ sessionID }: { sessionID: string }) => {
+      options.authoritative?.onCheck?.(sessionID)
+      if (options.authoritative?.fail) throw new Error("job failed")
+      return options.authoritative?.jobs ?? []
+    } } } } : {}),
   } as never, { directory: fixture }, options.delivery ?? "terminal", { claim: async (key, _sessionID, valid) => valid() && claim(key) })
   try {
     for (const input of events) await notifier.event(input)
@@ -218,4 +235,45 @@ test("user-message commands preserve their duration-independent behavior", async
   await exercise([event("session.inbox.enqueued", { sessionID: "s", inboxID: "message", item: { type: "user" } })], { delivery: "command", command: true, commandMinDuration: 60 })
   await waitForCommands(1)
   expect(readFileSync(commandLog, "utf8")).toBe("user_message\n")
+})
+
+test("V2 checks running background Jobs even when it missed child session events", async () => {
+  const checked: string[] = []
+  const output = await exercise([
+    event("session.execution.started", { sessionID: "parent" }),
+    event("session.execution.succeeded", { sessionID: "parent" }),
+  ], {
+    deferChildren: true,
+    authoritative: { jobs: [{ status: "running" }], onCheck: id => checked.push(id) },
+  })
+  expect(checked).toEqual(["parent"])
+  expect(output).toHaveLength(0)
+})
+
+test("V2 waits when a completed child's synthetic report is still queued for its parent", async () => {
+  const output = await exercise([event("session.execution.succeeded", { sessionID: "parent" })], {
+    deferChildren: true,
+    authoritative: {
+      jobs: [],
+      inbox: [{ type: "synthetic", payload: { metadata: { source: "subagent" } } }],
+    },
+  })
+  expect(output).toHaveLength(0)
+})
+
+test("V2 fails closed rather than sending a false completion when Job or inbox API fails", async () => {
+  const output = await exercise([event("session.execution.succeeded", { sessionID: "parent" })], {
+    deferChildren: true,
+    authoritative: { fail: true },
+  })
+  expect(output).toHaveLength(0)
+})
+
+test("V2 completes normally when its running Jobs and pending subagent reports are empty", async () => {
+  const output = await exercise([event("session.execution.succeeded", { sessionID: "parent" })], {
+    deferChildren: true,
+    authoritative: { jobs: [], inbox: [] },
+  })
+  expect(output.length).toBe(1)
+  expect(output[0]).toContain("PROBE_DONE")
 })

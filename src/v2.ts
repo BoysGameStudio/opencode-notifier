@@ -9,7 +9,28 @@ type Client = {
   permission: Pick<Plugin.Context["permission"], "list">
 }
 
+// These APIs are present on a V2 TUI OpenCodeClient (2.3.x), but not on the
+// server's Plugin.Context. Keep them optional for older clients/hosts.
+type WorkClient = {
+  experimental?: {
+    job?: {
+      list(input: { sessionID: string; descendants: true; status: "running" }): Promise<readonly unknown[]>
+    }
+  }
+  session: {
+    inbox?: {
+      list(input: { sessionID: string }): Promise<readonly {
+        type: string
+        payload?: { metadata?: { source?: string } }
+      }[]>
+    }
+  }
+}
+
 export function createV2Notifier(client: Client, location: LocationRef, delivery: Delivery, hooks: DeliveryHooks = {}) {
+  const work = client as Client & WorkClient
+  const jobs = work.experimental?.job
+  const inbox = work.session.inbox
   const notifier = createNotifier({
     async info(sessionID) {
       try {
@@ -36,6 +57,20 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
         return true
       }
     },
+    ...(jobs && inbox ? {
+      async hasOutstandingWork(sessionID: string) {
+        // Job state survives missed session.created events and includes descendants.
+        // A finished child can already have been removed from the Job registry
+        // while its completion report is still queued for the parent.
+        const [active, queued] = await Promise.all([
+          jobs.list({ sessionID, descendants: true, status: "running" }),
+          inbox.list({ sessionID }),
+        ])
+        return active.length > 0 || queued.some(item =>
+          item.type === "synthetic" && item.payload?.metadata?.source === "subagent"
+        )
+      },
+    } : {}),
   }, location.directory, delivery, hooks)
   const seen = new Set<string>()
   const owned = new Map<string, Promise<boolean>>()

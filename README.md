@@ -503,9 +503,11 @@ Set `"deferCompleteUntilChildrenIdle": true` to wait for known child sessions be
 
 The plugin tracks native OpenCode child sessions and their descendants from creation and execution events. When the parent goes idle while children run, its completion waits until all tracked child work finishes, fails, is interrupted, or is deleted.
 
-OpenCode usually resumes the parent with its children's results. The parent may start another wave of children before it writes its final answer. So after the last child stops, the plugin waits 2 more seconds. If the parent resumes in that time, the pending completion is cancelled and the parent's next idle decides again: it alerts if no children are running, or waits again. You get one completion, after the parent's final turn. If the parent does not resume within 2 seconds, the completion is sent then. A parent that resumes later than that produces this early alert and another one when it finishes.
+**OpenCode V2 terminal client (with Job and inbox APIs):** The notifier also queries running server-side background Jobs (including descendant work) and queued synthetic subagent reports. This catches native background work whose initial session events were missed. A deferred alert is sent only after the parent executes successfully again with no outstanding Jobs/reports, rather than after a fixed 2-second grace. If the parent never resumes, the pending alert expires silently; this intentionally favors a missing alert over an incorrect "finished" alert. If a Job/inbox lookup fails, completion is deferred rather than guessed.
 
-Work from third-party delegation plugins without native child-session events, or work already running before the notifier loads, cannot be tracked reliably.
+**OpenCode V1 and V2 server-only custom commands:** The authoritative V2 APIs are not available in these entrypoints, so the original 2-second grace still applies: the parent may resume too late and produce an early alert and another at its final turn. V2 terminal notifications require a client that exposes both `experimental.job.list` and `session.inbox.list`.
+
+Third-party delegation work that is not registered in native OpenCode background Jobs or child-session events still cannot be tracked reliably.
 
 `deferredCompleteTimeout` limits the wait in milliseconds, default `900000` (15 minutes). Expired pending alerts are dropped rather than reporting completion while work is still running.
 

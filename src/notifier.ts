@@ -24,6 +24,9 @@ export interface SessionAccess {
   info(sessionID: string): Promise<SessionInfo>
   elapsed(sessionID: string, now: number): Promise<number | null>
   permissionPending(sessionID: string | null, permissionID: string): Promise<boolean>
+  // V2 TUI: include server-side background Jobs and queued subagent reports.
+  // Absent on V1 and on server-only V2 delivery.
+  hasOutstandingWork?(sessionID: string): Promise<boolean>
 }
 
 export type Delivery = "all" | "terminal" | "command"
@@ -157,6 +160,10 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
   // A parent whose descendants all stopped alerts after a grace, unless it resumes first. Its next
   // busy drops the alert and its next idle decides again.
   function startGrace() {
+    // The V2 TUI can check authoritative outstanding work. After children stop,
+    // keep the alert pending until the parent's NEXT successful execution.
+    // A fixed grace cannot guarantee the parent has resumed.
+    if (access.hasOutstandingWork && config().deferCompleteUntilChildrenIdle) return
     for (const [id, deferred] of pending) {
       if (deferred.grace || hasRunningChildren(id)) continue
       const grace = setTimeout(() => {
@@ -189,14 +196,29 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     if (info.isChild === null) return
     if (info.isChild) children.add(sessionID)
     const current = config()
-    if (!info.isChild && current.deferCompleteUntilChildrenIdle && hasRunningChildren(sessionID)) {
+    let outstanding = false
+    if (!info.isChild && current.deferCompleteUntilChildrenIdle && access.hasOutstandingWork) {
+      try {
+        outstanding = await access.hasOutstandingWork(sessionID)
+      } catch {
+        // Losing the Job/inbox API must not turn uncertainty into a false "complete".
+        outstanding = true
+      }
+    }
+    // A parent may resume while metadata or outstanding work is being queried.
+    if (disposed || sequences.get(sessionID) !== sequence) return
+    if (!info.isChild && current.deferCompleteUntilChildrenIdle && (hasRunningChildren(sessionID) || outstanding)) {
       // Expiry drops the pending alert; it must not claim completion while work is still active.
       const timer = setTimeout(() => drop(sessionID), current.deferredCompleteTimeout)
       timer.unref()
       pending.set(sessionID, { title: info.title, key, timer })
       return
     }
-    await notify(info.isChild ? "subagent_complete" : "complete", sessionID, { title: info.title, now, key })
+    await notify(info.isChild ? "subagent_complete" : "complete", sessionID, {
+      title: info.title, now, key,
+      // Lookups and delivery claims can race with the next execution.started event.
+      valid: () => sequences.get(sessionID) === sequence,
+    })
   }
 
   // Bound tombstones and run state without discarding a live lookup or pending idle.
