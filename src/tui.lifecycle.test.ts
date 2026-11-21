@@ -64,9 +64,9 @@ async function harness(
     } as never)
     return {
       writes,
-      emit(type: string, sessionID: string, data: Record<string, unknown> = {}) {
+      emit(type: string, sessionID: string, data: Record<string, unknown> = {}, id?: string) {
         listener?.({ details: {
-          id: `lifecycle-${label}-${++nextID}`, type, location,
+          id: id ?? `lifecycle-${label}-${++nextID}`, type, location,
           data: { sessionID, ...data },
         } as OpenCodeEvent })
       },
@@ -197,6 +197,23 @@ test("high-volume text and reasoning deltas do not perform per-event session loo
     client.emit("session.execution.succeeded", "parent")
     await until(() => client.writes.some(write => write.includes("LIFECYCLE_stream-filter parent")),
       "Relevant completion was delayed by ignored stream events")
+  } finally {
+    await client.close()
+  }
+})
+
+test("replayed execution.started event does not invalidate a later legitimate completion", async () => {
+  const client = await harness("started-replay", async () => [])
+  try {
+    const replayedStartID = "replayed-started-id"
+    client.emit("session.execution.started", "parent", {}, replayedStartID)
+    client.emit("session.execution.succeeded", "parent")
+    // Durable stream replay of the exact same started event, after the success
+    // has already been received but before it has been processed.
+    client.emit("session.execution.started", "parent", {}, replayedStartID)
+    await until(() => client.writes.some(write => write.includes("LIFECYCLE_started-replay parent")),
+      "Duplicate start improperly invalidated the legitimate completion")
+    expect(client.writes.filter(write => write.includes("LIFECYCLE_started-replay parent"))).toHaveLength(1)
   } finally {
     await client.close()
   }

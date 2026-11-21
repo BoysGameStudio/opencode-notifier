@@ -16,6 +16,7 @@ type EventReceipt = {
   startVersion: number
   startedEarly: boolean
   stoppedEarly?: boolean
+  ignored?: boolean
 }
 
 // One bounded deadline for both server-side checks. Timeout rejects and the
@@ -202,6 +203,8 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           (event.data.item.type === "user" ||
            (event.data.item.type === "synthetic" &&
             event.data.item.payload.metadata?.source === "subagent"))) {
+        if (!first(`receipt:${event.id}`))
+          return { startVersion: startVersions.get(event.data.sessionID) ?? 0, startedEarly: false, ignored: true }
         const startVersion = advance(event.data.sessionID)
         notifier.stopped(event.data.sessionID)
         return { startVersion, startedEarly: false, stoppedEarly: true }
@@ -212,6 +215,8 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           event.type !== "session.execution.interrupted" &&
           event.type !== "session.deleted") return
       const sessionID = event.data.sessionID
+      if (!first(`receipt:${event.id}`))
+        return { startVersion: startVersions.get(sessionID) ?? 0, startedEarly: false, ignored: true }
       if (event.type === "session.execution.started") {
         const startVersion = advance(sessionID)
         notifier.busy(sessionID)
@@ -228,7 +233,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     },
     async event(event: OpenCodeEvent, receipt?: EventReceipt) {
       try {
-        if (disposed) return
+        if (disposed || receipt?.ignored) return
         const sessionID = event.type === "form.created" ? event.data.form.sessionID : "sessionID" in event.data ? event.data.sessionID : undefined
         const cached = sessionID ? owned.get(sessionID) : undefined
         if (sessionID && (event.type === "session.moved" || event.type === "session.deleted")) owned.delete(sessionID)
