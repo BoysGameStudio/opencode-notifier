@@ -53,6 +53,87 @@ test("delivery observed before a fast native tool return satisfies that round on
   expect(background.outstanding("parent")).toBe(true)
 })
 
+test("overflow defers only the affected session family and expires after the configured wait", () => {
+  let now = 0
+  const background = createBackgroundObserver({ now: () => now, uncertaintyTimeout: () => 100 })
+  const emit = (type: string, sessionID: string, data = {}) => background.event(event(`session.${type}`, { sessionID, ...data }))
+  emit("created", "parent", { parentID: "root" })
+  emit("created", "child", { parentID: "parent" })
+  for (let round = 0; round < 33; round++) {
+    emit("execution.started", "child")
+    background.idle("parent", [{ kind: "subagent", sessionID: "parent", childSessionID: "child" }])
+    emit("execution.succeeded", "child")
+  }
+  expect(background.outstanding("unrelated")).toBe(false)
+  expect(background.outstanding("root")).toBe(true)
+  for (let round = 0; round < 32; round++) {
+    const inboxID = `overflow-report-${round}`
+    emit("inbox.enqueued", "parent", { inboxID, item: { type: "synthetic", payload: { metadata: { source: "subagent", childID: "child" } } } })
+    emit("inbox.delivered", "parent", { inboxID })
+  }
+  expect(background.outstanding("parent")).toBe(true)
+  now = 101
+  expect(background.outstanding("parent")).toBe(false)
+  expect(background.outstanding("root")).toBe(false)
+})
+
+test("failed launches, cancelled reports and fast retries keep later server commands deliverable", async () => {
+  const log = join(fixture, "server-terminal-events.log")
+  const path = join(fixture, "server-terminal-events.json")
+  writeFileSync(path, JSON.stringify({
+    deferCompleteUntilChildrenIdle: true, notification: false, sound: false, bell: false,
+    command: { enabled: true, path: process.execPath, args: [commandScript, log, "{event}:{sessionID}"] },
+    events: { user_message: false, session_started: false, subagent_complete: false, user_cancelled: { command: true } },
+  }))
+  const previous = process.env.OPENCODE_NOTIFIER_CONFIG_PATH
+  process.env.OPENCODE_NOTIFIER_CONFIG_PATH = path
+  const location = { directory: fixture }
+  const notifier = createV2Notifier({
+    session: { get: async ({ sessionID }: { sessionID: string }) => ({ location, title: sessionID }) },
+  } as never, location, "command", {}, createBackgroundObserver())
+  const emit = (type: string, sessionID: string, data = {}) => {
+    const received = event(`session.${type}`, { sessionID, ...data })
+    notifier.enqueue(received)
+    return received
+  }
+  const finished = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").sort() : []
+  try {
+    const tool = { id: "never-started", assistantMessageID: "m", executed: true }
+    emit("execution.started", "launch-failure")
+    emit("tool.input.started", "launch-failure", { ...tool, name: "subagent" })
+    emit("tool.called", "launch-failure", tool)
+    emit("created", "never-started-child", { parentID: "launch-failure", location })
+    emit("tool.failed", "launch-failure", { ...tool, metadata: { status: "running", sessionID: "never-started-child" } })
+    emit("execution.succeeded", "launch-failure")
+
+    emit("execution.started", "cancelled-report")
+    emit("inbox.enqueued", "cancelled-report", { inboxID: "removed-report", item: { type: "synthetic", payload: { metadata: { source: "subagent", childID: "cancelled-child" } } } })
+    emit("execution.succeeded", "cancelled-report")
+    emit("inbox.cancelled", "cancelled-report", { inboxID: "removed-report" })
+
+    emit("execution.started", "retry")
+    const failure = emit("execution.failed", "retry", { error: {} })
+    emit("execution.started", "retry")
+    const interrupted = emit("execution.interrupted", "retry", { reason: "user" })
+    emit("execution.started", "retry")
+    emit("execution.succeeded", "retry")
+    notifier.enqueue(failure)
+    notifier.enqueue(interrupted)
+
+    for (let n = 0; n < 100 && finished().length < 4; n++) await Bun.sleep(10)
+    expect(finished()).toEqual(["complete:launch-failure", "complete:retry", "error:retry", "user_cancelled:retry"])
+
+    emit("execution.started", "cancelled-report")
+    emit("execution.succeeded", "cancelled-report")
+    for (let n = 0; n < 100 && finished().length < 5; n++) await Bun.sleep(10)
+    expect(finished()).toEqual(["complete:cancelled-report", "complete:launch-failure", "complete:retry", "error:retry", "user_cancelled:retry"])
+  } finally {
+    notifier.dispose()
+    if (previous === undefined) delete process.env.OPENCODE_NOTIFIER_CONFIG_PATH
+    else process.env.OPENCODE_NOTIFIER_CONFIG_PATH = previous
+  }
+})
+
 test("the server command waits through the outbox gap and a reused child's second round", async () => {
   const log = join(fixture, "server-rounds.log")
   const path = join(fixture, "server-rounds.json")

@@ -1,14 +1,14 @@
 import type { OpenCodeEvent } from "@opencode/client"
+import { loadConfig } from "./config"
 
 export type IdleBackground = { kind: string; sessionID: string; childSessionID?: string }
 
 type Round = {
-  began: number
   started: boolean
   ended?: number
   expected: boolean
   inboxID?: string
-  delivered: boolean
+  resolved: boolean
   observedFor?: Set<string>
 }
 
@@ -22,14 +22,24 @@ const backgroundEvents = new Set<OpenCodeEvent["type"]>([
 // The server context exposes live events and idle snapshots, but no Job or
 // inbox readback. Keep the expectation alive across child settlement and
 // correlate actual inbox delivery by its ID, independently of child activity.
-export function createBackgroundObserver() {
+export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = () => loadConfig().deferredCompleteTimeout } = {}) {
   const parents = new Map<string, string>()
   const rounds = new Map<string, Round[]>()
   const inputs = new Set<string>()
   const calls = new Map<string, { parent: string; began: number }>()
-  const inbox = new Map<string, { child: string; round: Round }>()
+  const inbox = new Map<string, { parent: string; round: Round }>()
+  const uncertainUntil = new Map<string, number>()
   let order = 0
-  let saturated = false
+
+  function pruneUncertainty(time: number) {
+    for (const [owner, deadline] of uncertainUntil) if (deadline <= time) uncertainUntil.delete(owner)
+  }
+
+  function markUncertain(owner: string) {
+    const time = now()
+    pruneUncertainty(time)
+    uncertainUntil.set(owner, time + uncertaintyTimeout())
+  }
 
   function rememberParent(child: string, parent: string) {
     if (!parents.has(child) && parents.size >= HISTORY_LIMIT) {
@@ -39,18 +49,18 @@ export function createBackgroundObserver() {
       for (const [id, owner] of parents) {
         const began = firstCall.get(owner) ?? Infinity
         if (ancestors.has(id) || rounds.get(id)?.some(round => round.ended === undefined || round.ended > began ||
-          (!round.delivered && (round.expected || round.inboxID)))) continue
+          (!round.resolved && (round.expected || round.inboxID)))) continue
         parents.delete(id)
         rounds.delete(id)
         break
       }
     }
-    remember(parents, child, parent)
+    return remember(parents, child, parent, parent)
   }
 
-  function remember<K, V>(map: Map<K, V>, key: K, value: V) {
+  function remember<K, V>(map: Map<K, V>, key: K, value: V, owner: string) {
     if (!map.has(key) && map.size >= HISTORY_LIMIT) {
-      saturated = true
+      markUncertain(owner)
       return false
     }
     map.delete(key)
@@ -58,29 +68,31 @@ export function createBackgroundObserver() {
     return true
   }
 
-  function add(child: string, began: number, started: boolean) {
+  function add(child: string, parent: string, started: boolean) {
     const history = rounds.get(child) ?? []
-    const round: Round = { began, started, expected: false, delivered: false }
+    const round: Round = { started, expected: false, resolved: false }
     if (history.length >= 32) {
-      const retired = history.findIndex(item => item.delivered || (!item.expected && !item.inboxID))
+      const retired = history.findIndex(item => item.resolved || (!item.expected && !item.inboxID))
       if (retired === -1) {
-        saturated = true
-        return round
+        markUncertain(parent)
+        return
       }
       history.splice(retired, 1)
     }
-    if (remember(rounds, child, history)) history.push(round)
+    if (!remember(rounds, child, history, parent)) return
+    history.push(round)
     return round
   }
 
   function expect(parent: string, child: string, began: number) {
-    rememberParent(child, parent)
+    if (!rememberParent(child, parent)) return
     const history = rounds.get(child)
     // A tool can return after its child and even after the inbox delivery.
     // A call into an already running child joins that round. Evidence from a
     // round that ended before this call cannot satisfy its result.
-    const round = history?.find(item => item.ended === undefined || item.ended > began) ?? add(child, began, false)
-    round.expected = true
+    const round = history?.find(item => item.ended === undefined || item.ended > began) ?? add(child, parent, false)
+    if (round) round.expected = true
+    return round
   }
 
   function belongsTo(child: string, parent: string) {
@@ -97,15 +109,15 @@ export function createBackgroundObserver() {
     idle(sessionID: string, background: readonly IdleBackground[]) {
       for (const work of background) {
         if (work.kind !== "subagent" || typeof work.childSessionID !== "string") continue
-        const active = rounds.get(work.childSessionID)?.at(-1)
-        if (active?.ended !== undefined) {
+        let round = rounds.get(work.childSessionID)?.at(-1)
+        if (round?.ended !== undefined) {
           // The idle snapshot may have been taken before the terminal event.
-          if (!active.delivered) active.expected = true
+          if (!round.resolved) round.expected = true
         } else {
-          expect(work.sessionID, work.childSessionID, order)
+          round = expect(work.sessionID, work.childSessionID, order)
         }
-        const round = rounds.get(work.childSessionID)?.at(-1)
-        if (round && !round.delivered && !belongsTo(work.sessionID, sessionID)) {
+        if (!round && !belongsTo(work.sessionID, sessionID)) markUncertain(sessionID)
+        if (round && !round.resolved && !belongsTo(work.sessionID, sessionID)) {
           (round.observedFor ??= new Set()).add(sessionID)
         }
       }
@@ -118,10 +130,11 @@ export function createBackgroundObserver() {
           break
         case "session.execution.started": {
           const id = event.data.sessionID
-          if (!parents.has(id)) break
+          const parent = parents.get(id)
+          if (!parent) break
           const last = rounds.get(id)?.at(-1)
           if (last && !last.started && last.ended === undefined) last.started = true
-          else add(id, at, true)
+          else add(id, parent, true)
           break
         }
         case "session.execution.succeeded":
@@ -136,13 +149,13 @@ export function createBackgroundObserver() {
           const { sessionID, assistantMessageID, id, name } = event.data
           if (name !== "subagent") break
           if (inputs.size < HISTORY_LIMIT) inputs.add(`${sessionID}\0${assistantMessageID}\0${id}`)
-          else saturated = true
+          else markUncertain(sessionID)
           break
         }
         case "session.tool.called": {
           const { sessionID, assistantMessageID, id, executed } = event.data
           const key = `${sessionID}\0${assistantMessageID}\0${id}`
-          if (inputs.delete(key) && executed) remember(calls, key, { parent: sessionID, began: at })
+          if (inputs.delete(key) && executed) remember(calls, key, { parent: sessionID, began: at }, sessionID)
           break
         }
         case "session.tool.success":
@@ -152,7 +165,8 @@ export function createBackgroundObserver() {
           const call = calls.get(key)
           inputs.delete(key)
           calls.delete(key)
-          if (call && metadata?.status === "running" && typeof metadata.sessionID === "string") {
+          // Failed tools can retain progress metadata written before launch.
+          if (event.type === "session.tool.success" && call && metadata?.status === "running" && typeof metadata.sessionID === "string") {
             expect(sessionID, metadata.sessionID, call.began)
           }
           break
@@ -164,34 +178,39 @@ export function createBackgroundObserver() {
           if (typeof child !== "string") break
           const history = rounds.get(child)
           if (inbox.has(inboxID) || history?.some(round => round.inboxID === inboxID)) break
-          rememberParent(child, sessionID)
+          if (!rememberParent(child, sessionID)) break
           // Child settlement precedes its report. Use the oldest unmatched
           // settlement, so an older report cannot release a later execution.
           const round = history?.find(item => item.expected && item.ended !== undefined && !item.inboxID)
             ?? history?.filter(item => item.ended !== undefined && !item.inboxID).at(-1)
             ?? history?.find(item => item.expected && !item.started && !item.inboxID)
-            ?? add(child, at, false)
+            ?? add(child, sessionID, false)
+          if (!round) break
           round.ended ??= at
           round.inboxID = inboxID
-          remember(inbox, inboxID, { child, round })
+          // The retained round bounds the index entry until it is resolved.
+          inbox.set(inboxID, { parent: sessionID, round })
           break
         }
         case "session.inbox.delivered":
         case "session.inbox.cancelled": {
-          const entry = inbox.get(event.data.inboxID)
-          if (!entry || parents.get(entry.child) !== event.data.sessionID) break
-          if (event.type === "session.inbox.delivered") entry.round.delivered = true
-          else entry.round.expected = true
-          inbox.delete(event.data.inboxID)
+          const { inboxID, sessionID } = event.data
+          const entry = inbox.get(inboxID)
+          if (entry?.parent !== sessionID) break
+          entry.round.resolved = true
+          inbox.delete(inboxID)
+          if (event.type === "session.inbox.cancelled") return sessionID
           break
         }
         case "session.deleted": {
           const id = event.data.sessionID
+          uncertainUntil.delete(id)
+          for (const [inboxID, entry] of inbox) if (entry.parent === id) inbox.delete(inboxID)
           for (const [key, call] of calls) if (call.parent === id) calls.delete(key)
           for (const key of inputs) if (key.startsWith(`${id}\0`)) inputs.delete(key)
           if (!parents.has(id)) {
             for (const [child] of parents) {
-              if (belongsTo(child, id) && !(rounds.get(child)?.some(round => round.expected && !round.delivered))) rounds.delete(child)
+              if (belongsTo(child, id) && !(rounds.get(child)?.some(round => round.expected && !round.resolved))) rounds.delete(child)
             }
           }
           break
@@ -199,11 +218,12 @@ export function createBackgroundObserver() {
       }
     },
     outstanding(sessionID: string) {
-      if (saturated) return true
+      pruneUncertainty(now())
+      for (const owner of uncertainUntil.keys()) if (belongsTo(owner, sessionID)) return true
       for (const call of calls.values()) if (belongsTo(call.parent, sessionID)) return true
       for (const [child, history] of rounds) {
         const parent = parents.get(child)
-        if (history.some(round => !round.delivered && (round.expected || round.inboxID) &&
+        if (history.some(round => !round.resolved && (round.expected || round.inboxID) &&
           (round.observedFor?.has(sessionID) || parent && belongsTo(parent, sessionID)))) return true
       }
       return false

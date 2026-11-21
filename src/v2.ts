@@ -205,6 +205,17 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     return true
   }
 
+  async function notifyFailure(sessionID: string, event: "error" | "user_cancelled", key: string, receipt?: EventReceipt) {
+    if (!first(key)) return
+    if (receipt && startVersions.get(sessionID) !== receipt.startVersion) {
+      // The event still happened, but its old terminal state must not replace
+      // the newer execution's state.
+      await notifier.notify(event, sessionID, { key })
+    } else {
+      await notifier.failed(sessionID, event, key)
+    }
+  }
+
   const queues = new Map<string, Promise<void>>()
   const adapter = {
     connected: () => notifier.notify("client_connected"),
@@ -215,8 +226,9 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
         // data.location, not necessarily in the envelope. Check that location
         // before tracking the child synchronously; it can start while the
         // parent has an in-flight Job/inbox check.
-        if (here(event.data.location) && first(`early-child:${event.data.sessionID}`)) {
-          void notifier.created(event.data.sessionID, event.data.parentID, event.data.title ?? null)
+        const placement = event.data.location ?? event.location
+        if (placement && here(placement) && first(`early-child:${event.data.sessionID}`)) {
+          notifier.track(event.data.sessionID, event.data.parentID)
         }
         return
       }
@@ -262,7 +274,13 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     enqueue(event: OpenCodeEvent) {
       if (disposed) return
       const placement = event.type === "session.created" ? event.data.location ?? event.location : event.location
-      if (background?.accepts(event) && (!placement || here(placement)) && first(`background:${event.id}`)) background.event(event)
+      if (background?.accepts(event) && (!placement || here(placement)) && first(`background:${event.id}`)) {
+        const cancelledReportOwner = background.event(event)
+        if (cancelledReportOwner) {
+          advance(cancelledReportOwner)
+          notifier.invalidate(cancelledReportOwner)
+        }
+      }
       if (!notificationEvent(event)) return
       const receipt = adapter.received(event)
       if (receipt?.ignored) return
@@ -301,7 +319,9 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
         switch (event.type) {
           case "session.created":
             if (first(`created:${event.data.sessionID}`)) {
-              await notifier.created(event.data.sessionID, event.data.parentID ?? null, event.data.title ?? null, `created:${event.data.sessionID}`)
+              const { sessionID, parentID, title } = event.data
+              if (parentID) notifier.track(sessionID, parentID)
+              else await notifier.created(sessionID, null, title ?? null, `created:${sessionID}`)
             }
             break
           case "session.execution.started":
@@ -315,17 +335,15 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
             forget(event.data.sessionID, receipt)
             break
           case "session.execution.failed":
-            if (receipt && startVersions.get(event.data.sessionID) !== receipt.startVersion) break
-            if (first(`failed:${event.id}`)) await notifier.failed(event.data.sessionID, "error", `failed:${event.id}`)
+            await notifyFailure(event.data.sessionID, "error", `failed:${event.id}`, receipt)
             forget(event.data.sessionID, receipt)
             break
           case "session.execution.interrupted":
-            if (receipt && startVersions.get(event.data.sessionID) !== receipt.startVersion) break
             // Shutdown, supersession and inactivity are not user cancellations or failures.
-            if (event.data.reason === "user" && first(`cancelled:${event.id}`)) {
-              await notifier.failed(event.data.sessionID, "user_cancelled", `cancelled:${event.id}`)
-            } else if (event.data.reason !== "user" && first(`stopped:${event.id}`)) {
-              await notifier.stopped(event.data.sessionID)
+            if (event.data.reason === "user") {
+              await notifyFailure(event.data.sessionID, "user_cancelled", `cancelled:${event.id}`, receipt)
+            } else if (!receipt && first(`stopped:${event.id}`)) {
+              notifier.stopped(event.data.sessionID)
             }
             forget(event.data.sessionID, receipt)
             break
