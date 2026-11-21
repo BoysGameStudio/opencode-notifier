@@ -42,14 +42,16 @@ async function exerciseRace(options: {
   const location = { directory: root }
   let jobsChecked = 0
   let gets = 0
-  let release!: (result: never) => void
-  const blocked = new Promise<never>(resolve => { release = resolve })
+  let release!: (result: unknown) => void
+  const blocked = new Promise<unknown>(resolve => { release = resolve })
+  const trace: string[] = []
   const emit = (id: string, type: string, eventLocation?: { directory: string }) => {
     const details = {
       id, type,
       ...(eventLocation ? { location: eventLocation } : {}),
       data: { sessionID: "parent" },
     } as OpenCodeEvent
+    trace.push(`emit:${id}`)
     listener?.({ details })
   }
 
@@ -61,6 +63,7 @@ async function exerciseRace(options: {
         session: {
           async get({ sessionID }: { sessionID: string }) {
             gets++
+            trace.push(`get#${gets}`)
             if (options.stall === "ownership" && gets === 1) return blocked
             return { id: sessionID, title: "parent task", location }
           },
@@ -69,6 +72,7 @@ async function exerciseRace(options: {
         experimental: { job: {
           async list() {
             jobsChecked++
+            trace.push(`job#${jobsChecked}`)
             if (options.stall === "job" && jobsChecked === 1) return blocked
             return []
           },
@@ -86,11 +90,13 @@ async function exerciseRace(options: {
     // A new start arrives while the old completion is stalled. In the foreign
     // case it belongs to a different workspace and must not cancel our alert.
     emit("parent-resumed", "session.execution.started", options.foreignStart ? { directory: "/foreign-project" } : location)
-    release([] as never)
+    release(options.stall === "ownership" ? { id: "parent", title: "parent task", location } : [])
     if (!options.foreignStart) {
       emit("final-complete", "session.execution.succeeded", location)
     }
-    await until(() => writes.filter(write => write.includes("RACE_DONE")).length >= 1, "Final completion was not notified")
+    for (let attempt = 0; attempt < 300 && !writes.some(write => write.includes("RACE_DONE")); attempt++) await Bun.sleep(5)
+    expect(writes.some(write => write.includes("RACE_DONE")),
+      `Final completion was not notified: ${trace.join(", ")}; output=${writes.join("").slice(0,300)}`).toBe(true)
     await Bun.sleep(40)
     expect(writes.filter(write => write.includes("RACE_DONE")).length).toBe(1)
   } finally {
