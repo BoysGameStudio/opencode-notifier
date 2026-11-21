@@ -452,3 +452,41 @@ test("duplicate child creation does not cancel a valid parent completion", async
   await completion
   expect(parentDone()).toBe(1)
 })
+
+test("V2 strict mode remembers a native child's parent across idle cleanup and subsequent reuse", async () => {
+  jest.useFakeTimers()
+  notifier.dispose()
+  notifier = createNotifier({
+    info: async id => ({ isChild: id.startsWith("child"), title: id }),
+    elapsed: async () => null,
+    permissionPending: async () => true,
+    waitForParentResume: true,
+  }, directory)
+  await notifier.created("child1", "parent", null)
+  await notifier.idle("child1")
+  await advance(5 * 60_000 + 1000)
+
+  // A follow-up to the SAME native Subagent session produces execution.started,
+  // but no new session.created. The parent link must still exist.
+  notifier.busy("child1")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(0)
+  await notifier.idle("child1")
+  notifier.busy("parent")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(1)
+})
+
+test("V2 strict mode retires deleted child ancestry without waiting for idle cleanup", async () => {
+  notifier.dispose()
+  notifier = createNotifier({
+    info: async id => ({ isChild: id.startsWith("child"), title: id }),
+    elapsed: async () => null,
+    permissionPending: async () => true,
+    waitForParentResume: true,
+  }, directory)
+  await notifier.created("child1", "parent", null)
+  notifier.deleted("child1")
+  await notifier.idle("parent")
+  expect(parentDone()).toBe(1)
+})

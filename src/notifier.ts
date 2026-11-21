@@ -12,6 +12,9 @@ const IDLE_COMPLETE_DELAY_MS = 350
 // OpenCode resumes a parent with its children's results right after the last one stops. 2 s leaves
 // room for the parent's busy event while still alerting soon for a parent that never resumes.
 export const CHILDREN_SETTLE_MS = 2000
+// Preserve recent native child ancestry across the five-minute idle cleanup:
+// OpenCode allows follow-up work in an existing Subagent session much later.
+const MAX_CACHED_CHILD_PARENTS = 4096
 
 export interface SessionInfo {
   // A failed lookup must never turn a deleted child into a parent.
@@ -140,8 +143,12 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
   // before its notification delivery claim settles. In strict V2 mode,
   // invalidate all known ancestors so that in-flight completion cannot pass
   // the final sequence check, even if the child finishes very quickly.
+  function strictParentTracking() {
+    return !!(access.waitForParentResume || access.hasOutstandingWork) && config().deferCompleteUntilChildrenIdle
+  }
+
   function invalidateAncestors(sessionID: string) {
-    if (!(access.waitForParentResume || access.hasOutstandingWork) || !config().deferCompleteUntilChildrenIdle) return
+    if (!strictParentTracking()) return
     const seen = new Set<string>([sessionID])
     let ancestor = parents.get(sessionID)
     while (ancestor && !seen.has(ancestor)) {
@@ -151,17 +158,31 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     }
   }
 
+  // Keep idle child parent links until explicitly deleted or displaced by newer
+  // relationships. Never evict running children or ancestors of running descendants.
+  function trimParentLinks() {
+    if (parents.size <= MAX_CACHED_CHILD_PARENTS) return
+    for (const [id] of parents) {
+      if (parents.size <= MAX_CACHED_CHILD_PARENTS) break
+      if (running.has(id) || hasRunningChildren(id)) continue
+      parents.delete(id)
+      children.delete(id)
+    }
+  }
+
   function track(sessionID: string, parentID?: string | null) {
     touched.set(sessionID, Date.now())
     if (parentID) {
       const previous = parents.get(sessionID)
       children.add(sessionID)
+      parents.delete(sessionID)
       parents.set(sessionID, parentID)
       // Ignore duplicate creation events; they are common when the V2 TUI
       // tracks a child synchronously and later processes the queued event.
       if (previous !== parentID) invalidateAncestors(sessionID)
       // A session can be running before its parent is known.
       holdGrace()
+      if (strictParentTracking()) trimParentLinks()
     }
   }
 
@@ -252,8 +273,11 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       children.delete(id)
       sequences.delete(id)
       errors.delete(id)
-      parents.delete(id)
+      // V2 native Subagents may restart after hours of idle time, without
+      // another session.created event. Retain bounded ancestry for that case.
+      if (!strictParentTracking()) parents.delete(id)
     }
+    if (strictParentTracking()) trimParentLinks()
   }, 5 * 60_000)
   cleanup.unref()
 
@@ -272,6 +296,12 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       invalidate(id)
       errors.delete(id)
       running.add(id)
+      // Refresh the LRU position of a reused native child after a long idle.
+      const parent = parents.get(id)
+      if (parent) {
+        parents.delete(id)
+        parents.set(id, parent)
+      }
       // An existing child may start a new round after its parent has already
       // passed the background Job check. Cancel that parent's in-flight alert.
       invalidateAncestors(id)
@@ -298,6 +328,17 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     stopped(id: string) {
       invalidate(id)
       running.delete(id)
+      startGrace()
+    },
+    deleted(id: string) {
+      invalidate(id)
+      running.delete(id)
+      // Descendants may still be draining after an intermediate child is
+      // deleted. Preserve its ancestor link until they all stop.
+      if (!hasRunningChildren(id)) {
+        children.delete(id)
+        parents.delete(id)
+      }
       startGrace()
     },
     async failed(id: string | null, event: "error" | "user_cancelled", key?: string) {

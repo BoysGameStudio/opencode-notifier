@@ -288,7 +288,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
             break
           case "session.deleted":
             if (receipt && startVersions.get(event.data.sessionID) !== receipt.startVersion) break
-            await notifier.stopped(event.data.sessionID)
+            notifier.deleted(event.data.sessionID)
             forget(event.data.sessionID, receipt)
             break
           case "session.moved":

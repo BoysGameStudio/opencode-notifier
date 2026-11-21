@@ -509,6 +509,8 @@ The plugin tracks native OpenCode child sessions and their descendants from crea
 
 **OpenCode V1:** Keeps the original 2-second grace. If the parent resumes later, it can still send an early alert and another at the final turn.
 
+Strict V2 mode retains native child-parent associations across the five-minute idle cleanup so resumed Subagents can still invalidate a parent's pending completion. The cache is limited to 4,096 associations; the oldest inactive links may be evicted on very large long-lived workloads.
+
 Third-party delegation work that is not registered in native OpenCode background Jobs or child-session events still cannot be tracked reliably.
 
 `deferredCompleteTimeout` limits the wait in milliseconds, default `900000` (15 minutes). Expired pending alerts are dropped rather than reporting completion while work is still running.
