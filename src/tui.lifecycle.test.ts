@@ -209,6 +209,35 @@ test("a synthetic Subagent report instantly cancels an in-flight parent completi
   }
 })
 
+test("a report queued in a descendant invalidates the root's in-flight completion", async () => {
+  let entered = false
+  let unblock!: () => void
+  const blocked = new Promise<void>(resolve => { unblock = resolve })
+  const client = await harness("descendant-report", async () => {
+    entered = true
+    await blocked
+    return []
+  })
+  try {
+    client.emit("session.created", "middle", { parentID: "root", location: { directory: root } })
+    client.emit("session.execution.succeeded", "root")
+    await until(() => entered, "Root completion did not reach its lookup")
+    client.emit("session.inbox.enqueued", "middle", {
+      inboxID: "nested-result",
+      item: { type: "synthetic", payload: { metadata: { source: "subagent" } } },
+    })
+    unblock()
+    await Bun.sleep(120)
+    expect(client.writes.some(write => write.includes("LIFECYCLE_descendant-report"))).toBe(false)
+    client.emit("session.execution.started", "root")
+    client.emit("session.execution.succeeded", "root")
+    await until(() => client.writes.some(write => write.includes("LIFECYCLE_descendant-report root")), "Final root notification missing")
+  } finally {
+    unblock()
+    await client.close()
+  }
+})
+
 test("a stalled Job lookup in one session does not block another session's completion", async () => {
   let entered = false
   let release!: (value: readonly { kind: string; status: string }[]) => void

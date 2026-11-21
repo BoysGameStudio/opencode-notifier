@@ -288,6 +288,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     notify,
     track,
     invalidate,
+    invalidateAncestors,
     settled(id: string) {
       running.delete(id)
       return { sequence: sequences.get(id) ?? invalidate(id), runningChildren: strictParentTracking() && hasRunningChildren(id) }

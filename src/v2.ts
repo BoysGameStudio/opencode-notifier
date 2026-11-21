@@ -22,7 +22,7 @@ type EventReceipt = {
   ignored?: boolean
 }
 
-// One bounded deadline for both server-side checks. Timeout rejects and the
+// One bounded deadline for all server-side checks. Timeout rejects and the
 // notifier retains its pending completion rather than guessing "finished".
 export const OUTSTANDING_WORK_TIMEOUT_MS = 2500
 
@@ -72,6 +72,13 @@ type WorkClient = {
     }
   }
   session: {
+    list?(
+      input: { parentID: string; cursor?: string; limit: number },
+      options?: { signal?: AbortSignal },
+    ): Promise<{
+      data: readonly { id: string; parentID?: string | null }[]
+      cursor?: { next?: string | null }
+    }>
     inbox?: {
       list(
         input: { sessionID: string },
@@ -82,6 +89,40 @@ type WorkClient = {
       }[]>
     }
   }
+}
+
+async function hasQueuedSubagentReport(session: WorkClient["session"], inbox: NonNullable<WorkClient["session"]["inbox"]>, root: string, signal: AbortSignal) {
+  const sessions = new Set([root])
+  const pending = [root]
+  const batchSize = 8
+  for (let offset = 0; offset < pending.length;) {
+    const batch = pending.slice(offset, offset + batchSize)
+    offset += batch.length
+    const results = await Promise.all(batch.map(async sessionID => {
+      signal.throwIfAborted()
+      const queued = await inbox.list({ sessionID }, { signal })
+      if (queued.some(item => item.type === "synthetic" && item.payload?.metadata?.source === "subagent")) return true
+      if (!session.list) return false
+
+      let cursor: string | undefined
+      const cursors = new Set<string>()
+      do {
+        signal.throwIfAborted()
+        const page = await session.list({ parentID: sessionID, limit: 100, ...(cursor ? { cursor } : {}) }, { signal })
+        for (const child of page.data) {
+          if (child.parentID !== sessionID || sessions.has(child.id)) continue
+          sessions.add(child.id)
+          pending.push(child.id)
+        }
+        cursor = page.cursor?.next ?? undefined
+        if (cursor && cursors.has(cursor)) throw new Error("OpenCode session list repeated a cursor")
+        if (cursor) cursors.add(cursor)
+      } while (cursor)
+      return false
+    }))
+    if (results.includes(true)) return true
+  }
+  return false
 }
 
 export function createV2Notifier(client: Client, location: LocationRef, delivery: Delivery, hooks: DeliveryHooks = {}, background?: ReturnType<typeof createBackgroundObserver>) {
@@ -128,14 +169,9 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           // -> inbox-admission gap and causes premature parent completion.
           const records = await jobs.list({ sessionID, descendants: true }, { signal })
           if (records.some(job => job.status === "running" || job.kind === "subagent")) return true
-          // Read the inbox AFTER the Job registry. OpenCode admits the synthetic
-          // report before it consumes/deletes its outbox row. A sequential check
-          // therefore avoids taking an empty pre-admission inbox snapshot next
-          // to an empty post-acknowledgement Job snapshot.
-          const queued = await inbox.list({ sessionID }, { signal })
-          return queued.some(item =>
-            item.type === "synthetic" && item.payload?.metadata?.source === "subagent"
-          )
+          // Read inboxes after the Job registry. OpenCode moves each report to
+          // its immediate parent's inbox before removing it from the outbox.
+          return hasQueuedSubagentReport(work.session, inbox, sessionID, signal)
         })
       },
     } : {}),
@@ -247,6 +283,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           return { startVersion: startVersions.get(event.data.sessionID) ?? 0, startedEarly: false, ignored: true }
         const startVersion = advance(event.data.sessionID)
         notifier.invalidate(event.data.sessionID)
+        if (event.data.item.type === "synthetic") notifier.invalidateAncestors(event.data.sessionID)
         return { startVersion, startedEarly: false }
       }
       if (event.type !== "session.execution.started" &&

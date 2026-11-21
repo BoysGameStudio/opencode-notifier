@@ -176,9 +176,19 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
         case "session.execution.failed":
         case "session.execution.interrupted": {
           const child = event.data.sessionID
-          const last = rounds.get(child)?.at(-1)
-          if (!last || last.ended !== undefined) break
+          const history = rounds.get(child)
+          const last = history?.at(-1)
+          if (!history || !last || last.ended !== undefined) break
           last.ended = at
+          // A newer settlement follows the previous round's live admission
+          // attempt. Retire earlier guesses whose reports never entered the
+          // inbox. An observed Job or queued report still needs its own ack.
+          if (reportsDirectChildren && last.started) {
+            for (const item of history) {
+              if (item === last) break
+              if (!item.expected && !item.inboxID && item.inferredUntil !== undefined) item.resolved = true
+            }
+          }
           // OpenCode 2.3 reports direct child turns too. Automation children
           // run quietly, and successful control-only turns produce no report.
           const expectsReport = event.type === "session.execution.succeeded" ? last.assistantCompleted
@@ -222,10 +232,11 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
           const history = rounds.get(child)
           if (inbox.has(inboxID) || history?.some(round => round.inboxID === inboxID)) break
           if (!rememberParent(child, sessionID)) break
-          // Child settlement precedes its report. Use the oldest unmatched
-          // settlement, so an older report cannot release a later execution.
-          const round = history?.find(item => !item.resolved && (item.expected || item.inferredUntil !== undefined) && item.ended !== undefined && !item.inboxID)
-            ?? history?.filter(item => item.ended !== undefined && !item.inboxID).at(-1)
+          // Prefer a pending settlement. An actual late admission remains
+          // outstanding even if no tracked round currently expects it.
+          const time = now()
+          const round = history?.find(item => item.ended !== undefined && !item.inboxID && hasPendingResult(item, time))
+            ?? history?.filter(item => !item.resolved && item.ended !== undefined && !item.inboxID).at(-1)
             ?? history?.find(item => item.expected && !item.started && !item.inboxID)
             ?? add(child, sessionID, false)
           if (!round) break

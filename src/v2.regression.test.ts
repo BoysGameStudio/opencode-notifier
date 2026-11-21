@@ -56,6 +56,46 @@ test("OpenCode 2.3 direct child answers block completion before their report ent
   expect(background.outstanding("parent")).toBe(false)
 })
 
+for (const previous of ["unexpired", "expired", "late", "queued"] as const) {
+  test(`a ${previous} direct result does not consume the reused child's new result`, () => {
+    let now = 0
+    const background = createBackgroundObserver({ reportsDirectChildren: true, now: () => now, uncertaintyTimeout: () => 100 })
+    const emit = (type: string, sessionID: string, data = {}) => background.event(event(`session.${type}`, { sessionID, ...data }))
+    const enqueue = (inboxID: string) => emit("inbox.enqueued", "parent", {
+      inboxID, item: { type: "synthetic", payload: { metadata: { source: "subagent", childID: "child" } } },
+    })
+
+    emit("created", "child", { parentID: "parent" })
+    emit("execution.started", "child")
+    emit("step.started", "child", { assistantMessageID: "first" })
+    emit("step.ended", "child", { assistantMessageID: "first", finish: "stop" })
+    emit("execution.succeeded", "child")
+    expect(background.outstanding("parent")).toBe(true)
+    now = previous === "unexpired" ? 99 : 101
+    expect(background.outstanding("parent")).toBe(previous === "unexpired")
+
+    const tool = { id: "reuse", assistantMessageID: "parent-message", executed: true }
+    emit("tool.input.started", "parent", { ...tool, name: "subagent" })
+    emit("tool.called", "parent", tool)
+    emit("execution.started", "child")
+    if (previous === "late" || previous === "queued") {
+      enqueue("old-result")
+      expect(background.outstanding("parent")).toBe(true)
+      if (previous === "late") emit("inbox.delivered", "parent", { inboxID: "old-result" })
+    }
+    emit("execution.succeeded", "child")
+    enqueue("new-result")
+    emit("tool.success", "parent", { ...tool, metadata: { status: "running", sessionID: "child" } })
+    expect(background.outstanding("parent")).toBe(true)
+    emit("inbox.delivered", "parent", { inboxID: "new-result" })
+    if (previous === "queued") {
+      expect(background.outstanding("parent")).toBe(true)
+      emit("inbox.delivered", "parent", { inboxID: "old-result" })
+    }
+    expect(background.outstanding("parent")).toBe(false)
+  })
+}
+
 test("deleting a child preserves its result already queued in a live parent's inbox", () => {
   const background = createBackgroundObserver()
   const emit = (type: string, sessionID: string, data = {}) => background.event(event(`session.${type}`, { sessionID, ...data }))
@@ -288,6 +328,8 @@ test("a timed-out permission lookup releases subsequent delivery in the same ses
   }
 })
 
+type InboxItem = { type: string; payload?: { metadata?: { source?: string } } }
+
 async function exercise(events: OpenCodeEvent[], options: {
   minDuration?: number
   commandMinDuration?: number
@@ -304,7 +346,12 @@ async function exercise(events: OpenCodeEvent[], options: {
   deferChildren?: boolean
   authoritative?: {
     jobs?: readonly object[]
-    inbox?: readonly { type: string; payload?: { metadata?: { source?: string } } }[]
+    inbox?: readonly InboxItem[]
+    readInbox?: (sessionID: string) => readonly InboxItem[]
+    listChildren?: (parentID: string, cursor?: string) => {
+      data: readonly { id: string; parentID: string }[]
+      cursor?: { next?: string }
+    }
     fail?: boolean
     onCheck?: (sessionID: string) => void
     onCheckInput?: (input: { sessionID: string; descendants?: boolean; status?: string }) => void
@@ -338,10 +385,13 @@ async function exercise(events: OpenCodeEvent[], options: {
         return { id: "session", title: "test", location: options.sessionLocation, ...(options.child ? { parentID: "parent", agent: options.agentName } : {}) }
       },
       context: async () => [{ id: "message", type: "user", text: "hello", time: { created: Date.now() - (options.messageAge ?? 1000) } } satisfies SessionMessageUser],
-      ...(options.authoritative ? { inbox: { list: async () => {
+      ...(options.authoritative?.listChildren ? {
+        list: async ({ parentID, cursor }: { parentID: string; cursor?: string }) => options.authoritative!.listChildren!(parentID, cursor),
+      } : {}),
+      ...(options.authoritative ? { inbox: { list: async ({ sessionID }: { sessionID: string }) => {
         options.authoritative?.onInbox?.()
         if (options.authoritative?.fail) throw new Error("inbox failed")
-        return options.authoritative?.inbox ?? []
+        return options.authoritative?.readInbox?.(sessionID) ?? options.authoritative?.inbox ?? []
       } } } : {}),
     },
     permission: { list: async () => [] },
@@ -525,6 +575,44 @@ test("V2 waits when a completed child's synthetic report is still queued for its
     authoritative: {
       jobs: [],
       inbox: [{ type: "synthetic", payload: { metadata: { source: "subagent" } } }],
+    },
+  })
+  expect(output).toHaveLength(0)
+})
+
+test("V2 reads descendant inboxes after the outbox is empty, even without child events", async () => {
+  const checked: string[] = []
+  let queued: readonly InboxItem[] = [{ type: "synthetic", payload: { metadata: { source: "subagent" } } }]
+  const options = {
+    deferChildren: true,
+    authoritative: {
+      onCheck: () => checked.push("jobs"),
+      listChildren: (parentID: string, cursor?: string) => {
+        if (parentID === "root") return cursor
+          ? { data: [{ id: "middle", parentID }] }
+          : { data: [{ id: "other-child", parentID }], cursor: { next: "second-page" } }
+        if (parentID === "middle") return { data: [{ id: "report-owner", parentID }] }
+        return { data: [] }
+      },
+      readInbox: (sessionID: string) => {
+        checked.push(sessionID)
+        return sessionID === "report-owner" ? queued : []
+      },
+    },
+  }
+  const success = () => event("session.execution.succeeded", { sessionID: "root" })
+  expect(await exercise([success()], options)).toHaveLength(0)
+  expect(checked[0]).toBe("jobs")
+  expect(checked).toContain("report-owner")
+  queued = [{ type: "synthetic", payload: { metadata: { source: "shell" } } }]
+  expect(await exercise([success()], options)).toHaveLength(1)
+})
+
+test("V2 treats a non-advancing child list cursor as unknown", async () => {
+  const output = await exercise([event("session.execution.succeeded", { sessionID: "root" })], {
+    deferChildren: true,
+    authoritative: {
+      listChildren: () => ({ data: [], cursor: { next: "same-page" } }),
     },
   })
   expect(output).toHaveLength(0)
