@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - Child activity invalidates queued completion alerts, and moving or deleting a child releases stale local execution state.
 - OpenCode 2.3 direct child turns defer completion while their reports are in transit. Deleting a child preserves any report already queued for a live parent.
 - Reusing a child after an unconfirmed direct result no longer blocks later completion alerts. The V2 terminal also waits for subagent reports queued in descendant inboxes.
+- The V2 terminal waits for active descendant executions even if they have already consumed a report and have no background Job.
 
 ## [1.1.3] - 2026-11-14
 

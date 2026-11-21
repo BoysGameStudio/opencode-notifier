@@ -346,6 +346,7 @@ async function exercise(events: OpenCodeEvent[], options: {
   deferChildren?: boolean
   authoritative?: {
     jobs?: readonly object[]
+    readActive?: () => readonly string[]
     inbox?: readonly InboxItem[]
     readInbox?: (sessionID: string) => readonly InboxItem[]
     listChildren?: (parentID: string, cursor?: string) => {
@@ -376,6 +377,7 @@ async function exercise(events: OpenCodeEvent[], options: {
     cb?.()
     return true
   }) as typeof process.stdout.write
+  const { readActive, listChildren } = options.authoritative ?? {}
   const notifier = createV2Notifier({
     session: {
       get: async () => {
@@ -385,8 +387,11 @@ async function exercise(events: OpenCodeEvent[], options: {
         return { id: "session", title: "test", location: options.sessionLocation, ...(options.child ? { parentID: "parent", agent: options.agentName } : {}) }
       },
       context: async () => [{ id: "message", type: "user", text: "hello", time: { created: Date.now() - (options.messageAge ?? 1000) } } satisfies SessionMessageUser],
-      ...(options.authoritative?.listChildren ? {
-        list: async ({ parentID, cursor }: { parentID: string; cursor?: string }) => options.authoritative!.listChildren!(parentID, cursor),
+      ...(readActive ? {
+        active: async () => Object.fromEntries(readActive().map(id => [id, { type: "running" }])),
+      } : {}),
+      ...(listChildren ? {
+        list: async ({ parentID, cursor }: { parentID: string; cursor?: string }) => listChildren(parentID, cursor),
       } : {}),
       ...(options.authoritative ? { inbox: { list: async ({ sessionID }: { sessionID: string }) => {
         options.authoritative?.onInbox?.()
@@ -613,6 +618,43 @@ test("V2 treats a non-advancing child list cursor as unknown", async () => {
     deferChildren: true,
     authoritative: {
       listChildren: () => ({ data: [], cursor: { next: "same-page" } }),
+    },
+  })
+  expect(output).toHaveLength(0)
+})
+
+test("V2 checks active descendants without treating the root or unrelated sessions as outstanding", async () => {
+  let active = ["root", "unrelated", "last-child"]
+  const checks: string[] = []
+  const options = {
+    deferChildren: true,
+    authoritative: {
+      readActive: () => { checks.push("active"); return active },
+      onCheck: () => checks.push("jobs"),
+      listChildren: (parentID: string) => {
+        const id = parentID === "root" ? "middle" : parentID === "middle" ? "last-child" : undefined
+        return { data: id ? [{ id, parentID }] : [] }
+      },
+    },
+  }
+  const success = () => event("session.execution.succeeded", { sessionID: "root" })
+  expect(await exercise([success()], options)).toHaveLength(0)
+  expect(checks).toEqual(["active", "jobs"])
+  active = ["root", "unrelated"]
+  expect(await exercise([success()], options)).toHaveLength(1)
+})
+
+test("V2 rechecks activity if a descendant can take its report during the inbox scan", async () => {
+  let processing = false
+  const output = await exercise([event("session.execution.succeeded", { sessionID: "root" })], {
+    deferChildren: true,
+    authoritative: {
+      readActive: () => processing ? ["middle"] : [],
+      listChildren: parentID => ({ data: parentID === "root" ? [{ id: "middle", parentID }] : [] }),
+      readInbox: sessionID => {
+        if (sessionID === "root") processing = true
+        return []
+      },
     },
   })
   expect(output).toHaveLength(0)

@@ -72,6 +72,7 @@ type WorkClient = {
     }
   }
   session: {
+    active?(options?: { signal?: AbortSignal }): Promise<Readonly<Record<string, unknown>>>
     list?(
       input: { parentID: string; cursor?: string; limit: number },
       options?: { signal?: AbortSignal },
@@ -91,7 +92,13 @@ type WorkClient = {
   }
 }
 
-async function hasQueuedSubagentReport(session: WorkClient["session"], inbox: NonNullable<WorkClient["session"]["inbox"]>, root: string, signal: AbortSignal) {
+async function hasOutstandingSessionWork(
+  session: WorkClient["session"],
+  inbox: NonNullable<WorkClient["session"]["inbox"]>,
+  root: string,
+  active: ReadonlySet<string>,
+  signal: AbortSignal,
+) {
   const sessions = new Set([root])
   const pending = [root]
   const batchSize = 8
@@ -100,6 +107,7 @@ async function hasQueuedSubagentReport(session: WorkClient["session"], inbox: No
     offset += batch.length
     const results = await Promise.all(batch.map(async sessionID => {
       signal.throwIfAborted()
+      if (sessionID !== root && active.has(sessionID)) return true
       const queued = await inbox.list({ sessionID }, { signal })
       if (queued.some(item => item.type === "synthetic" && item.payload?.metadata?.source === "subagent")) return true
       if (!session.list) return false
@@ -122,7 +130,12 @@ async function hasQueuedSubagentReport(session: WorkClient["session"], inbox: No
     }))
     if (results.includes(true)) return true
   }
-  return false
+  // A descendant can consume its inbox after the first activity snapshot.
+  // Reuse the discovered family to check for executions that took that work.
+  if (sessions.size === 1 || !session.active) return false
+  signal.throwIfAborted()
+  const current = await session.active({ signal })
+  return Object.keys(current).some(id => id !== root && sessions.has(id))
 }
 
 export function createV2Notifier(client: Client, location: LocationRef, delivery: Delivery, hooks: DeliveryHooks = {}, background?: ReturnType<typeof createBackgroundObserver>) {
@@ -164,6 +177,9 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
         // A finished child can already have been removed from the Job registry
         // while its completion report is still queued for the parent.
         return boundedQuery(async signal => {
+          // Direct child executions can be active without a background Job.
+          // Capture activity before reading the outbox and inboxes it feeds.
+          const active = await work.session.active?.({ signal })
           // The Job registry includes unconsumed terminal Subagent reports in
           // the durable outbox. Filtering to "running" misses the settlement
           // -> inbox-admission gap and causes premature parent completion.
@@ -171,7 +187,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           if (records.some(job => job.status === "running" || job.kind === "subagent")) return true
           // Read inboxes after the Job registry. OpenCode moves each report to
           // its immediate parent's inbox before removing it from the outbox.
-          return hasQueuedSubagentReport(work.session, inbox, sessionID, signal)
+          return hasOutstandingSessionWork(work.session, inbox, sessionID, new Set(Object.keys(active ?? {})), signal)
         })
       },
     } : {}),
