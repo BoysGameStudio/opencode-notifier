@@ -464,7 +464,9 @@ test("V2 strict mode remembers a native child's parent across idle cleanup and s
   }, directory)
   await notifier.created("child1", "parent", null)
   await notifier.idle("child1")
-  await advance(5 * 60_000 + 1000)
+  // Idle cleanup runs every five minutes. Advance past its SECOND scan:
+  // at the first scan, lastSeen is still exactly at the cutoff.
+  await advance(10 * 60_000 + 1000)
 
   // A follow-up to the SAME native Subagent session produces execution.started,
   // but no new session.created. The parent link must still exist.
