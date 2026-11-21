@@ -152,7 +152,9 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
   }
 
   // Some V2 events carry only a sessionID, so ownership comes from the session itself.
-  // Lookup failures fail open and are retried on the next event.
+  // Timed-out/unavailable ownership is unknown (null) and retried on the next
+  // event: completion fails closed, but actionable permission/question alerts
+  // retain their historical fail-open behavior.
   function ours(sessionID: string) {
     let result = owned.get(sessionID)
     if (!result) {
