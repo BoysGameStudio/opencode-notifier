@@ -114,6 +114,7 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
   }
 
   return {
+    reportsDirectChildren,
     accepts(event: OpenCodeEvent) {
       if (event.type === "session.step.started" || event.type === "session.step.ended") {
         return reportsDirectChildren && parents.has(event.data.sessionID)

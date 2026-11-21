@@ -60,8 +60,10 @@ export function notificationEvent(event: OpenCodeEvent) {
   }
 }
 
-// These APIs are present on a V2 TUI OpenCodeClient (2.3.x), but not on the
-// server's Plugin.Context. Keep them optional for older clients/hosts.
+type FamilySession = { id: string; parentID?: string | null; time?: { busy?: number; idle?: number } }
+
+// The TUI can read active executions, Jobs and inboxes. The server plugin can
+// list sessions and wait for an execution to settle. Older hosts vary.
 type WorkClient = {
   experimental?: {
     job?: {
@@ -77,9 +79,10 @@ type WorkClient = {
       input: { parentID: string; cursor?: string; limit: number },
       options?: { signal?: AbortSignal },
     ): Promise<{
-      data: readonly { id: string; parentID?: string | null }[]
+      data: readonly FamilySession[]
       cursor?: { next?: string | null }
     }>
+    wait?(input: { sessionID: string }, options?: { signal?: AbortSignal }): Promise<unknown>
     inbox?: {
       list(
         input: { sessionID: string },
@@ -92,36 +95,33 @@ type WorkClient = {
   }
 }
 
-async function hasOutstandingSessionWork(
-  session: Client["session"] & WorkClient["session"],
-  inbox: NonNullable<WorkClient["session"]["inbox"]>,
+const SESSION_BATCH_SIZE = 8
+
+async function scanSessionFamily(
+  session: WorkClient["session"],
   root: string,
-  active: ReadonlySet<string>,
   signal: AbortSignal,
-  completedAt?: number,
+  hasOutstanding: (entry: FamilySession) => Promise<boolean>,
 ) {
   const sessions = new Set([root])
-  const pending = [root]
-  const batchSize = 8
+  const pending: FamilySession[] = [{ id: root }]
   for (let offset = 0; offset < pending.length;) {
-    const batch = pending.slice(offset, offset + batchSize)
+    const batch = pending.slice(offset, offset + SESSION_BATCH_SIZE)
     offset += batch.length
-    const results = await Promise.all(batch.map(async sessionID => {
+    const results = await Promise.all(batch.map(async entry => {
       signal.throwIfAborted()
-      if (sessionID !== root && active.has(sessionID)) return true
-      const queued = await inbox.list({ sessionID }, { signal })
-      if (queued.some(item => item.type === "synthetic" && item.payload?.metadata?.source === "subagent")) return true
+      if (await hasOutstanding(entry)) return true
       if (!session.list) return false
 
       let cursor: string | undefined
       const cursors = new Set<string>()
       do {
         signal.throwIfAborted()
-        const page = await session.list({ parentID: sessionID, limit: 100, ...(cursor ? { cursor } : {}) }, { signal })
+        const page = await session.list({ parentID: entry.id, limit: 100, ...(cursor ? { cursor } : {}) }, { signal })
         for (const child of page.data) {
-          if (child.parentID !== sessionID || sessions.has(child.id)) continue
+          if (child.parentID !== entry.id || sessions.has(child.id)) continue
           sessions.add(child.id)
-          pending.push(child.id)
+          pending.push(child)
         }
         cursor = page.cursor?.next ?? undefined
         if (cursor && cursors.has(cursor)) throw new Error("OpenCode session list repeated a cursor")
@@ -129,8 +129,25 @@ async function hasOutstandingSessionWork(
       } while (cursor)
       return false
     }))
-    if (results.includes(true)) return true
+    if (results.includes(true)) return null
   }
+  return sessions
+}
+
+async function hasOutstandingTerminalWork(
+  session: Client["session"] & WorkClient["session"],
+  inbox: NonNullable<WorkClient["session"]["inbox"]>,
+  root: string,
+  active: ReadonlySet<string>,
+  signal: AbortSignal,
+  completedAt?: number,
+) {
+  const sessions = await scanSessionFamily(session, root, signal, async ({ id }) => {
+    if (id !== root && active.has(id)) return true
+    const queued = await inbox.list({ sessionID: id }, { signal })
+    return queued.some(item => item.type === "synthetic" && item.payload?.metadata?.source === "subagent")
+  })
+  if (!sessions) return true
   // A descendant can consume its inbox after the first activity snapshot.
   // Reuse the discovered family to check for executions that took that work.
   if (sessions.size === 1) return false
@@ -143,12 +160,35 @@ async function hasOutstandingSessionWork(
   // Require a later root success when a child settled in or after the same
   // millisecond, which is the precision of the host's timestamps.
   if (completedAt === undefined) return false
-  for (let offset = 1; offset < pending.length; offset += batchSize) {
+  const ids = [...sessions]
+  for (let offset = 1; offset < ids.length; offset += SESSION_BATCH_SIZE) {
     signal.throwIfAborted()
-    const descendants = await Promise.all(pending.slice(offset, offset + batchSize).map(sessionID => session.get({ sessionID }, { signal })))
+    const descendants = await Promise.all(ids.slice(offset, offset + SESSION_BATCH_SIZE).map(sessionID => session.get({ sessionID }, { signal })))
     if (descendants.some(child => (child.time?.idle ?? -Infinity) >= completedAt)) return true
   }
   return false
+}
+
+async function hasOutstandingServerWork(
+  session: Client["session"] & WorkClient["session"],
+  root: string,
+  signal: AbortSignal,
+  completedAt: number,
+) {
+  const sessions = await scanSessionFamily(session, root, signal, async ({ id, time }) => {
+    if (id === root) return false
+    const idle = time?.idle ?? -Infinity
+    if (idle >= completedAt) return true
+    if (time?.busy === undefined || time.busy < idle || !session.wait) return false
+
+    // Shutdown can leave an old busy timestamp. Wait on the live execution
+    // within the caller's deadline and check for settlement after the root.
+    await session.wait({ sessionID: id }, { signal })
+    signal.throwIfAborted()
+    const child = await session.get({ sessionID: id }, { signal })
+    return (child.time?.idle ?? -Infinity) >= completedAt
+  })
+  return sessions === null
 }
 
 export function createV2Notifier(client: Client, location: LocationRef, delivery: Delivery, hooks: DeliveryHooks = {}, background?: ReturnType<typeof createBackgroundObserver>) {
@@ -184,6 +224,11 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     waitForParentResume: true,
     ...(background ? {
       hasObservedOutstandingWork: background.outstanding,
+      ...(background.reportsDirectChildren && typeof work.session.list === "function" && typeof work.session.wait === "function" ? {
+        hasOutstandingWork: (sessionID: string, completedAt?: number) => completedAt === undefined
+          ? Promise.resolve(false)
+          : boundedQuery(signal => hasOutstandingServerWork(work.session, sessionID, signal, completedAt)),
+      } : {}),
     } : jobs && typeof jobs.list === "function" && inbox && typeof inbox.list === "function" ? {
       async hasOutstandingWork(sessionID: string, completedAt?: number) {
         // Job state survives missed session.created events and includes descendants.
@@ -200,7 +245,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           if (records.some(job => job.status === "running" || job.kind === "subagent")) return true
           // Read inboxes after the Job registry. OpenCode moves each report to
           // its immediate parent's inbox before removing it from the outbox.
-          return hasOutstandingSessionWork(work.session, inbox, sessionID, new Set(Object.keys(active ?? {})), signal, completedAt)
+          return hasOutstandingTerminalWork(work.session, inbox, sessionID, new Set(Object.keys(active ?? {})), signal, completedAt)
         })
       },
     } : {}),

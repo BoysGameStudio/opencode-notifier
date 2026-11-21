@@ -348,10 +348,11 @@ async function exercise(events: OpenCodeEvent[], options: {
     jobs?: readonly object[]
     readActive?: () => readonly string[]
     lastSettled?: (sessionID: string) => number | undefined
+    waitForServerSession?: (sessionID: string, signal?: AbortSignal) => Promise<void>
     inbox?: readonly InboxItem[]
     readInbox?: (sessionID: string) => readonly InboxItem[]
     listChildren?: (parentID: string, cursor?: string) => {
-      data: readonly { id: string; parentID: string }[]
+      data: readonly { id: string; parentID: string; time?: { busy?: number; idle?: number } }[]
       cursor?: { next?: string }
     }
     fail?: boolean
@@ -378,7 +379,7 @@ async function exercise(events: OpenCodeEvent[], options: {
     cb?.()
     return true
   }) as typeof process.stdout.write
-  const { readActive, listChildren } = options.authoritative ?? {}
+  const { readActive, listChildren, waitForServerSession } = options.authoritative ?? {}
   const notifier = createV2Notifier({
     session: {
       get: async ({ sessionID }: { sessionID: string }) => {
@@ -394,6 +395,9 @@ async function exercise(events: OpenCodeEvent[], options: {
       ...(listChildren ? {
         list: async ({ parentID, cursor }: { parentID: string; cursor?: string }) => listChildren(parentID, cursor),
       } : {}),
+      ...(waitForServerSession ? {
+        wait: ({ sessionID }: { sessionID: string }, { signal }: { signal?: AbortSignal }) => waitForServerSession(sessionID, signal),
+      } : {}),
       ...(options.authoritative ? { inbox: { list: async ({ sessionID }: { sessionID: string }) => {
         options.authoritative?.onInbox?.()
         if (options.authoritative?.fail) throw new Error("inbox failed")
@@ -407,7 +411,8 @@ async function exercise(events: OpenCodeEvent[], options: {
       if (options.authoritative?.fail) throw new Error("job failed")
       return options.authoritative?.jobs ?? []
     } } } } : {}),
-  } as never, { directory: fixture }, options.delivery ?? "terminal", { claim: async (key, _sessionID, valid) => valid() && claim(key) })
+  } as never, { directory: fixture }, options.delivery ?? "terminal", { claim: async (key, _sessionID, valid) => valid() && claim(key) },
+  waitForServerSession ? createBackgroundObserver({ reportsDirectChildren: true }) : undefined)
   try {
     for (const input of events) await notifier.event(input)
     return writes.filter(w => w.includes("PROBE_"))
@@ -695,6 +700,31 @@ test("V2 waits for a later root success when the child and root settle in the sa
   const success = (created: number) => ({ ...event("session.execution.succeeded", { sessionID: "root" }), created })
   expect(await exercise([success(100)], options)).toHaveLength(0)
   expect(await exercise([success(101)], options)).toHaveLength(1)
+})
+
+test("V2 server distinguishes a child that settles during its lookup from a stale busy timestamp", async () => {
+  let childIdle = 80
+  let settling = true
+  const checked: string[] = []
+  const options = {
+    deferChildren: true,
+    authoritative: {
+      listChildren: (parentID: string) => ({
+        data: parentID === "root" ? [{ id: "child", parentID, time: { busy: 90, idle: childIdle } }] : [],
+      }),
+      lastSettled: (sessionID: string) => sessionID === "child" ? childIdle : undefined,
+      waitForServerSession: async (sessionID: string) => {
+        checked.push(sessionID)
+        if (settling) childIdle = 110
+      },
+    },
+  }
+  const success = () => ({ ...event("session.execution.succeeded", { sessionID: "root" }), created: 100 })
+  expect(await exercise([success()], options)).toHaveLength(0)
+  childIdle = 80
+  settling = false
+  expect(await exercise([success()], options)).toHaveLength(1)
+  expect(checked).toEqual(["child", "child"])
 })
 
 test("V2 fails closed rather than sending a false completion when Job or inbox API fails", async () => {
