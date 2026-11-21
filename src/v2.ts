@@ -57,7 +57,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
         return true
       }
     },
-    ...(jobs && inbox ? {
+    ...(jobs && typeof jobs.list === "function" && inbox && typeof inbox.list === "function" ? {
       async hasOutstandingWork(sessionID: string) {
         // Job state survives missed session.created events and includes descendants.
         // A finished child can already have been removed from the Job registry

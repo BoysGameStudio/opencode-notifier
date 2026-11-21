@@ -41,7 +41,8 @@ const setup: Plugin.Definition["setup"] = async (ctx) => {
     const current = ctx.location ?? ctx.data.location.default()
     eventQueue = eventQueue.then(async () => {
       if (disposed) return
-      await clients.refresh()
+      // Presence refresh is best-effort; a temporary failure must not lose events.
+      try { await clients.refresh() } catch {}
       if (current.directory !== location.directory || current.workspaceID !== location.workspaceID) {
         notifier.dispose()
         location = current
