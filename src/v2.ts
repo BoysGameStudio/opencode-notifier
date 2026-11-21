@@ -213,7 +213,8 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           event.type !== "session.execution.succeeded" &&
           event.type !== "session.execution.failed" &&
           event.type !== "session.execution.interrupted" &&
-          event.type !== "session.deleted") return
+          event.type !== "session.deleted" &&
+          event.type !== "session.moved") return
       const sessionID = event.data.sessionID
       if (!first(`receipt:${event.id}`))
         return { startVersion: startVersions.get(sessionID) ?? 0, startedEarly: false, ignored: true }
@@ -243,6 +244,10 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           : event.type === "session.deleted" ? !cached || await cached
           : await ours(sessionID)
         if (!mine) {
+          // A move can be delivered to both the former and new locations.
+          // Its synchronous receipt already invalidated a pending completion
+          // for the former owner; release its generation record here.
+          if (event.type === "session.moved" && sessionID) forget(sessionID, receipt)
           debug(`v2 ${event.type}: session ${sessionID ?? "none"} belongs to another location, skipping`)
           return
         }
@@ -282,6 +287,12 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           case "session.deleted":
             if (receipt && startVersions.get(event.data.sessionID) !== receipt.startVersion) break
             await notifier.stopped(event.data.sessionID)
+            forget(event.data.sessionID, receipt)
+            break
+          case "session.moved":
+            // Moving a Session changes its owner and invalidates completion
+            // generated at the previous location. The ownership cache was
+            // cleared before the move's location check.
             forget(event.data.sessionID, receipt)
             break
           case "permission.asked":

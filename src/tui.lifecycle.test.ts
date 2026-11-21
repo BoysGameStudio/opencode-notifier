@@ -218,3 +218,26 @@ test("replayed execution.started event does not invalidate a later legitimate co
     await client.close()
   }
 })
+
+test("moving a session out of a workspace invalidates an in-flight completion", async () => {
+  let entered = false
+  let release!: (value: readonly { kind: string; status: string }[]) => void
+  const blocked = new Promise<readonly { kind: string; status: string }[]>(resolve => { release = resolve })
+  const client = await harness("workspace-move", async () => {
+    entered = true
+    return blocked
+  })
+  try {
+    client.emit("session.execution.succeeded", "parent")
+    await until(() => entered, "Move test never started lookup")
+    // OpenCode routes session.moved to both locations. Its public event has
+    // the destination in data.location but often no envelope location.
+    client.emit("session.moved", "parent", { location: { directory: "/new-workspace" } })
+    release([])
+    await Bun.sleep(120)
+    expect(client.writes.some(write => write.includes("LIFECYCLE_workspace-move parent"))).toBe(false)
+  } finally {
+    release([])
+    await client.close()
+  }
+})
