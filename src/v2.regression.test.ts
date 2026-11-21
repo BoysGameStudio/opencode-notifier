@@ -43,6 +43,8 @@ async function exercise(events: OpenCodeEvent[], options: {
     inbox?: readonly { type: string; payload?: { metadata?: { source?: string } } }[]
     fail?: boolean
     onCheck?: (sessionID: string) => void
+    onCheckInput?: (input: { sessionID: string; descendants?: boolean; status?: string }) => void
+    onInbox?: () => void
   }
 } = {}) {
   writeFileSync(configPath, JSON.stringify({
@@ -72,13 +74,15 @@ async function exercise(events: OpenCodeEvent[], options: {
       },
       context: async () => [{ id: "message", type: "user", text: "hello", time: { created: Date.now() - (options.messageAge ?? 1000) } } satisfies SessionMessageUser],
       ...(options.authoritative ? { inbox: { list: async () => {
+        options.authoritative?.onInbox?.()
         if (options.authoritative?.fail) throw new Error("inbox failed")
         return options.authoritative?.inbox ?? []
       } } } : {}),
     },
     permission: { list: async () => [] },
-    ...(options.authoritative ? { experimental: { job: { list: async ({ sessionID }: { sessionID: string }) => {
-      options.authoritative?.onCheck?.(sessionID)
+    ...(options.authoritative ? { experimental: { job: { list: async (input: { sessionID: string; descendants?: boolean; status?: string }) => {
+      options.authoritative?.onCheck?.(input.sessionID)
+      options.authoritative?.onCheckInput?.(input)
       if (options.authoritative?.fail) throw new Error("job failed")
       return options.authoritative?.jobs ?? []
     } } } } : {}),
@@ -276,4 +280,56 @@ test("V2 completes normally when its running Jobs and pending subagent reports a
   })
   expect(output.length).toBe(1)
   expect(output[0]).toContain("PROBE_DONE")
+})
+
+test("V2 holds completion for a settled but unacknowledged Subagent outbox record", async () => {
+  const inputs: { sessionID: string; descendants?: boolean; status?: string }[] = []
+  const output = await exercise([event("session.execution.succeeded", { sessionID: "unacknowledged" })], {
+    deferChildren: true,
+    authoritative: {
+      jobs: [{ kind: "subagent", status: "completed" }],
+      inbox: [],
+      onCheckInput: input => inputs.push(input),
+    },
+  })
+  expect(output).toHaveLength(0)
+  // Filtering to "running" here would hide the completed durable outbox row.
+  expect(inputs).toEqual([{ sessionID: "unacknowledged", descendants: true }])
+})
+
+test("V2 also holds failed/cancelled Subagent outbox reports awaiting delivery", async () => {
+  for (const status of ["error", "cancelled"]) {
+    const output = await exercise([event("session.execution.succeeded", { sessionID: "outbox-" + status })], {
+      deferChildren: true,
+      authoritative: { jobs: [{ kind: "subagent", status }], inbox: [] },
+    })
+    expect(output).toHaveLength(0)
+  }
+})
+
+test("V2 ignores an unrelated completed non-Subagent Job", async () => {
+  const output = await exercise([event("session.execution.succeeded", { sessionID: "shell-complete" })], {
+    deferChildren: true,
+    authoritative: { jobs: [{ kind: "shell", status: "completed" }], inbox: [] },
+  })
+  expect(output).toHaveLength(1)
+})
+
+test("V2 reads Job registry before Inbox to prevent cross-snapshot false completion", async () => {
+  const order: string[] = []
+  const authoritative = {
+    jobs: [] as readonly object[],
+    inbox: [] as { type: string; payload?: { metadata?: { source?: string } } }[],
+    onCheck: () => {
+      order.push("jobs")
+      // A synthetic report enters the inbox after the Job snapshot.
+      authoritative.inbox = [{ type: "synthetic", payload: { metadata: { source: "subagent" } } }]
+    },
+    onInbox: () => order.push("inbox"),
+  }
+  const output = await exercise([event("session.execution.succeeded", { sessionID: "inbox-race" })], {
+    deferChildren: true, authoritative,
+  })
+  expect(order).toEqual(["jobs", "inbox"])
+  expect(output).toHaveLength(0)
 })
