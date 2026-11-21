@@ -30,7 +30,7 @@ type WorkClient = {
 export function createV2Notifier(client: Client, location: LocationRef, delivery: Delivery, hooks: DeliveryHooks = {}) {
   const work = client as Client & WorkClient
   const jobs = work.experimental?.job
-  const inbox = work.session.inbox
+  const inbox = work.session?.inbox
   const notifier = createNotifier({
     async info(sessionID) {
       try {
