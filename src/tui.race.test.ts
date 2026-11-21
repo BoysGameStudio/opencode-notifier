@@ -1,5 +1,6 @@
 import { afterAll, expect, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "fs"
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs"
+import { createHash } from "crypto"
 import { tmpdir } from "os"
 import { join } from "path"
 import type { OpenCodeEvent } from "@opencode/client"
@@ -70,7 +71,10 @@ async function exerciseRace(options: {
             if (options.stall === "ownership" && gets === 1) return blocked
             return { id: sessionID, title: "parent task", location }
           },
-          inbox: { list: async () => [] },
+          inbox: { list: async () => {
+            trace.push("inbox")
+            return []
+          } },
         },
         experimental: { job: {
           async list() {
@@ -98,8 +102,12 @@ async function exerciseRace(options: {
       emit("final-complete", "session.execution.succeeded", location)
     }
     for (let attempt = 0; attempt < 300 && !writes.some(write => write.includes("RACE_DONE")); attempt++) await Bun.sleep(5)
+    const eventID = `${options.stall}:${options.foreignStart ? "foreign" : "local"}:${options.foreignStart ? "old-complete" : "final-complete"}`
+    const claimKey = `${location.directory}\0complete:${eventID}`
+    const claimPath = join(tmpdir(), `opencode-notifier-${process.getuid?.() ?? "claims"}`,
+      createHash("sha256").update(claimKey).digest("hex"))
     expect(writes.some(write => write.includes("RACE_DONE")),
-      `Final completion was not notified: ${trace.join(", ")}; output=${writes.join("").slice(0,300)}`).toBe(true)
+      `Final completion was not notified: ${trace.join(", ")}; claimed=${existsSync(claimPath)}; output=${writes.join("").slice(0,300)}`).toBe(true)
     await Bun.sleep(40)
     expect(writes.filter(write => write.includes("RACE_DONE")).length).toBe(1)
   } finally {
