@@ -19,7 +19,7 @@ async function until(predicate: () => boolean, explanation: string, attempts = 2
 async function harness(
   label: string,
   jobs: (sessionID: string) => Promise<readonly { kind: string; status: string }[]>,
-  onGet?: (sessionID: string) => void,
+  onGet?: (sessionID: string) => void | Promise<void>,
 ) {
   const path = join(root, `config-${label}.json`)
   writeFileSync(path, JSON.stringify({
@@ -52,7 +52,7 @@ async function harness(
       client: {
         session: {
           get: async ({ sessionID }: { sessionID: string }) => {
-            onGet?.(sessionID)
+            await onGet?.(sessionID)
             return { id: sessionID, title: sessionID, location }
           },
           inbox: { list: async () => [] },
@@ -85,6 +85,54 @@ async function harness(
     throw error
   }
 }
+
+for (const timing of ["already-running", "starts-later"]) {
+  test(`a queued parent completion stays suppressed when a child ${timing}`, async () => {
+    let entered = false
+    let release!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const client = await harness(`queued-${timing}`, async () => [], id => {
+      if (id === "parent" && !entered) {
+        entered = true
+        return blocked
+      }
+    })
+    try {
+      client.emit("session.created", "child", { location: { directory: root }, parentID: "parent" })
+      client.emit("session.execution.started", "parent", {}, undefined, false)
+      await until(() => entered, "Parent queue was not waiting on ownership")
+      if (timing === "already-running") client.emit("session.execution.started", "child")
+      client.emit("session.execution.succeeded", "parent")
+      if (timing === "starts-later") client.emit("session.execution.started", "child")
+      client.emit("session.execution.succeeded", "child")
+      release()
+      await Bun.sleep(120)
+      expect(client.writes.some(write => write.includes(`LIFECYCLE_queued-${timing}`))).toBe(false)
+
+      client.emit("session.execution.started", "parent")
+      client.emit("session.execution.succeeded", "parent")
+      await until(() => client.writes.some(write => write.includes(`LIFECYCLE_queued-${timing} parent`)), "Final parent completion did not arrive")
+    } finally {
+      release()
+      await client.close()
+    }
+  })
+}
+
+test("a child moved away does not re-enter local running state through a locationless event", async () => {
+  const client = await harness("child-moved-away", async () => [])
+  try {
+    client.emit("session.created", "child", { location: { directory: root }, parentID: "parent" })
+    client.emit("session.execution.started", "child")
+    client.emit("session.moved", "child", { location: { directory: "/other-workspace" } }, undefined, false)
+    client.emit("session.execution.started", "child", {}, undefined, false)
+    client.emit("session.execution.started", "parent")
+    client.emit("session.execution.succeeded", "parent")
+    await until(() => client.writes.some(write => write.includes("LIFECYCLE_child-moved-away parent")), "Foreign child continued to block the local parent")
+  } finally {
+    await client.close()
+  }
+})
 
 test("queueing input for a running child does not release its parent's completion", async () => {
   const client = await harness("queued-child-input", async () => [])

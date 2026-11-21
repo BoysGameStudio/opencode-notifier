@@ -59,6 +59,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
   const children = new Set<string>()
   const sequences = new Map<string, number>()
   const errors = new Set<string>()
+  let nextSequence = 0
   const touched = new Map<string, number>()
   const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const parents = new Map<string, string>()
@@ -92,7 +93,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
 
   function invalidate(sessionID: string): number {
     touched.set(sessionID, Date.now())
-    const sequence = (sequences.get(sessionID) ?? 0) + 1
+    const sequence = ++nextSequence
     sequences.set(sessionID, sequence)
     clearTimeout(idleTimers.get(sessionID))
     idleTimers.delete(sessionID)
@@ -289,6 +290,10 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     invalidate,
     settled(id: string) {
       running.delete(id)
+      return { sequence: sequences.get(id) ?? invalidate(id), runningChildren: strictParentTracking() && hasRunningChildren(id) }
+    },
+    completionCurrent(id: string, sequence: number) {
+      return sequences.get(id) === sequence
     },
     async created(id: string | null, parentID: string | null, title: string | null, key?: string) {
       if (id) track(id, parentID)
@@ -338,6 +343,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     },
     deleted(id: string) {
       invalidate(id)
+      invalidateAncestors(id)
       running.delete(id)
       // Descendants may still be draining after an intermediate child is
       // deleted. Preserve its ancestor link until they all stop.
@@ -346,6 +352,11 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
         parents.delete(id)
       }
       startGrace()
+    },
+    movedAway(id: string) {
+      invalidate(id)
+      invalidateAncestors(id)
+      running.delete(id)
     },
     async failed(id: string | null, event: "error" | "user_cancelled", key?: string) {
       if (id) {

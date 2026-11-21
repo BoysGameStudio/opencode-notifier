@@ -17,6 +17,7 @@ type Client = {
 type EventReceipt = {
   startVersion: number
   startedEarly: boolean
+  completionSequence?: number
   blocked?: boolean
   ignored?: boolean
 }
@@ -143,7 +144,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
   // null means ownership is unresolved, not that the session belongs here.
   // Completion must fail closed on unknown ownership; permission/question
   // prompts retain their historical fail-open behavior.
-  const owned = new Map<string, Promise<boolean | null>>()
+  const owned = new Map<string, boolean | Promise<boolean | null>>()
   // Versions are per-session and removed after terminal handling. A global
   // monotonically increasing token prevents accidental reuse across sessions.
   const startVersions = new Map<string, number>()
@@ -174,9 +175,17 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
   // Timed-out/unavailable ownership is unknown (null) and retried on the next
   // event: completion fails closed, but actionable permission/question alerts
   // retain their historical fail-open behavior.
+  function rememberOwner(sessionID: string, owner: boolean | Promise<boolean | null>) {
+    owned.set(sessionID, owner)
+    if (owned.size > 2048) {
+      const oldest = owned.keys().next().value
+      if (oldest !== undefined) owned.delete(oldest)
+    }
+  }
+
   function ours(sessionID: string) {
     let result = owned.get(sessionID)
-    if (!result) {
+    if (result === undefined) {
       result = boundedQuery(signal => client.session.get({ sessionID }, { signal })).then(
         session => !session.location || here(session.location),
         () => {
@@ -185,11 +194,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
           return null
         },
       )
-      owned.set(sessionID, result)
-      if (owned.size > 2048) {
-        const oldest = owned.keys().next().value
-        if (oldest !== undefined) owned.delete(oldest)
-      }
+      rememberOwner(sessionID, result)
     }
     return result
   }
@@ -220,7 +225,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
   const adapter = {
     connected: () => notifier.notify("client_connected"),
     received(event: OpenCodeEvent): EventReceipt | undefined {
-      if (disposed || (event.location && !here(event.location))) return
+      if (disposed || (event.type !== "session.moved" && event.location && !here(event.location))) return
       if (event.type === "session.created" && event.data.parentID) {
         // OpenCode's durable session.created event carries its location in
         // data.location, not necessarily in the envelope. Check that location
@@ -253,27 +258,41 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
       const sessionID = event.data.sessionID
       if (!first(`receipt:${event.id}`))
         return { startVersion: startVersions.get(sessionID) ?? 0, startedEarly: false, ignored: true }
+      if (event.type === "session.moved") {
+        const mine = here(event.data.location)
+        rememberOwner(sessionID, mine)
+        if (!mine) {
+          notifier.movedAway(sessionID)
+          background?.movedAway(sessionID)
+        } else {
+          notifier.invalidate(sessionID)
+        }
+        return { startVersion: advance(sessionID), startedEarly: false }
+      }
       if (event.type === "session.execution.started") {
         const startVersion = advance(sessionID)
         notifier.busy(sessionID)
         return { startVersion, startedEarly: true }
       }
       if (event.type === "session.execution.succeeded") {
-        notifier.settled(sessionID)
+        const { sequence, runningChildren } = notifier.settled(sessionID)
         // Inbox delivery that arrives later must not retroactively make an old
         // success eligible for notification.
-        return { startVersion: startVersions.get(sessionID) ?? 0, startedEarly: false, blocked: background?.outstanding(sessionID) }
+        return { startVersion: startVersions.get(sessionID) ?? 0, startedEarly: false, completionSequence: sequence,
+          blocked: runningChildren || background?.outstanding(sessionID) }
       }
       // Failed, interrupted, moved and deleted sessions invalidate completions
       // before the asynchronous queue reaches them.
       const startVersion = advance(sessionID)
-      if (event.type === "session.moved") notifier.invalidate(sessionID)
+      if (event.type === "session.deleted") notifier.deleted(sessionID)
       else notifier.stopped(sessionID)
       return { startVersion, startedEarly: false }
     },
     enqueue(event: OpenCodeEvent) {
       if (disposed) return
       const placement = event.type === "session.created" ? event.data.location ?? event.location : event.location
+      const sessionID = event.type === "form.created" ? event.data.form.sessionID : "sessionID" in event.data ? event.data.sessionID : undefined
+      if (!placement && sessionID && owned.get(sessionID) === false && event.type !== "session.moved" && event.type !== "session.deleted") return
       if (background?.accepts(event) && (!placement || here(placement)) && first(`background:${event.id}`)) {
         const cancelledReportOwner = background.event(event)
         if (cancelledReportOwner) {
@@ -284,18 +303,18 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
       if (!notificationEvent(event)) return
       const receipt = adapter.received(event)
       if (receipt?.ignored) return
-      const key = event.type === "form.created" ? event.data.form.sessionID : "sessionID" in event.data ? event.data.sessionID : undefined
-      const task = (queues.get(key ?? "") ?? Promise.resolve()).then(() => adapter.event(event, receipt)).finally(() => {
-        if (queues.get(key ?? "") === task) queues.delete(key ?? "")
+      const key = sessionID ?? ""
+      const task = (queues.get(key) ?? Promise.resolve()).then(() => adapter.event(event, receipt)).finally(() => {
+        if (queues.get(key) === task) queues.delete(key)
       })
-      queues.set(key ?? "", task)
+      queues.set(key, task)
     },
     async event(event: OpenCodeEvent, receipt?: EventReceipt) {
       try {
         if (disposed || receipt?.ignored) return
         const sessionID = event.type === "form.created" ? event.data.form.sessionID : "sessionID" in event.data ? event.data.sessionID : undefined
         const cached = sessionID ? owned.get(sessionID) : undefined
-        if (sessionID && (event.type === "session.moved" || event.type === "session.deleted")) owned.delete(sessionID)
+        if (sessionID && (event.type === "session.deleted" || (event.type === "session.moved" && !receipt))) owned.delete(sessionID)
         // A deleted session can no longer be looked up, so only a cached answer can drop it.
         // session.created carries authoritative location in its payload even
         // when there is no location envelope. Never override that with a
@@ -331,6 +350,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
             // A later start/stop may already be received while this completion
             // was waiting on its session queue or an API lookup.
             if (receipt && (startVersions.get(event.data.sessionID) ?? 0) !== receipt.startVersion) break
+            if (receipt?.completionSequence !== undefined && !notifier.completionCurrent(event.data.sessionID, receipt.completionSequence)) break
             if (first(`complete:${event.id}`)) await notifier.idle(event.data.sessionID, true, `complete:${event.id}`, receipt?.blocked)
             forget(event.data.sessionID, receipt)
             break
@@ -349,7 +369,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
             break
           case "session.deleted":
             if (receipt && startVersions.get(event.data.sessionID) !== receipt.startVersion) break
-            notifier.deleted(event.data.sessionID)
+            if (!receipt) notifier.deleted(event.data.sessionID)
             forget(event.data.sessionID, receipt)
             break
           case "session.moved":

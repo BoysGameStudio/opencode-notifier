@@ -77,6 +77,24 @@ test("overflow defers only the affected session family and expires after the con
   expect(background.outstanding("root")).toBe(false)
 })
 
+test("a moved child still waits for its report and deletion releases a separate child's expectation", () => {
+  const background = createBackgroundObserver()
+  const emit = (type: string, sessionID: string, data = {}) => background.event(event(`session.${type}`, { sessionID, ...data }))
+  for (const child of ["moved-child", "deleted-child"]) {
+    emit("created", child, { parentID: "parent" })
+    emit("execution.started", child)
+    background.idle("parent", [{ kind: "subagent", sessionID: "parent", childSessionID: child }])
+  }
+  background.movedAway("moved-child")
+  emit("deleted", "deleted-child")
+  expect(background.outstanding("parent")).toBe(true)
+  const inboxID = "report-after-move"
+  emit("inbox.enqueued", "parent", { inboxID, item: { type: "synthetic", payload: { metadata: { source: "subagent", childID: "moved-child" } } } })
+  expect(background.outstanding("parent")).toBe(true)
+  emit("inbox.delivered", "parent", { inboxID })
+  expect(background.outstanding("parent")).toBe(false)
+})
+
 test("failed launches, cancelled reports and fast retries keep later server commands deliverable", async () => {
   const log = join(fixture, "server-terminal-events.log")
   const path = join(fixture, "server-terminal-events.json")

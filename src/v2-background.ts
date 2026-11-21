@@ -106,6 +106,12 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
 
   return {
     accepts(event: OpenCodeEvent) { return backgroundEvents.has(event.type) },
+    movedAway(sessionID: string) {
+      const round = rounds.get(sessionID)?.at(-1)
+      // The result still belongs to the parent, although this location may
+      // no longer see the child's terminal event.
+      if (round && round.ended === undefined) round.ended = ++order
+    },
     idle(sessionID: string, background: readonly IdleBackground[]) {
       for (const work of background) {
         if (work.kind !== "subagent" || typeof work.childSessionID !== "string") continue
@@ -205,7 +211,13 @@ export function createBackgroundObserver({ now = Date.now, uncertaintyTimeout = 
         case "session.deleted": {
           const id = event.data.sessionID
           uncertainUntil.delete(id)
-          for (const [inboxID, entry] of inbox) if (entry.parent === id) inbox.delete(inboxID)
+          for (const [child, history] of rounds) {
+            if (child !== id && parents.get(child) !== id) continue
+            for (const round of history) {
+              round.resolved = true
+              if (round.inboxID) inbox.delete(round.inboxID)
+            }
+          }
           for (const [key, call] of calls) if (call.parent === id) calls.delete(key)
           for (const key of inputs) if (key.startsWith(`${id}\0`)) inputs.delete(key)
           if (!parents.has(id)) {
