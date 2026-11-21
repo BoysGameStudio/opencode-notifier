@@ -189,10 +189,12 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     // event that has not reached notifier.idle() yet.
     received(event: OpenCodeEvent): EventReceipt | undefined {
       if (disposed || (event.location && !here(event.location))) return
-      if (event.type === "session.created" && event.data.parentID && event.location) {
-        // A child may start while the parent's completed-Job lookup is pending.
-        // Register it synchronously, before its own queued async handler.
-        if (first(`early-child:${event.data.sessionID}`)) {
+      if (event.type === "session.created" && event.data.parentID) {
+        // OpenCode's durable session.created event carries its location in
+        // data.location, not necessarily in the envelope. Check that location
+        // before tracking the child synchronously; it can start while the
+        // parent has an in-flight Job/inbox check.
+        if (here(event.data.location) && first(`early-child:${event.data.sessionID}`)) {
           void notifier.created(event.data.sessionID, event.data.parentID, event.data.title ?? null)
         }
         return

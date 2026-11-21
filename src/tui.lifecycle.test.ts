@@ -64,9 +64,10 @@ async function harness(
     } as never)
     return {
       writes,
-      emit(type: string, sessionID: string, data: Record<string, unknown> = {}, id?: string) {
+      emit(type: string, sessionID: string, data: Record<string, unknown> = {}, id?: string, envelope = true) {
         listener?.({ details: {
-          id: id ?? `lifecycle-${label}-${++nextID}`, type, location,
+          id: id ?? `lifecycle-${label}-${++nextID}`, type,
+          ...(envelope ? { location } : {}),
           data: { sessionID, ...data },
         } as OpenCodeEvent })
       },
@@ -236,6 +237,39 @@ test("moving a session out of a workspace invalidates an in-flight completion", 
     release([])
     await Bun.sleep(120)
     expect(client.writes.some(write => write.includes("LIFECYCLE_workspace-move parent"))).toBe(false)
+  } finally {
+    release([])
+    await client.close()
+  }
+})
+
+test("a location-less native child-created event immediately protects a pending parent completion", async () => {
+  let entered = false
+  let release!: (value: readonly { kind: string; status: string }[]) => void
+  const blocked = new Promise<readonly { kind: string; status: string }[]>(resolve => { release = resolve })
+  const client = await harness("child-created", async () => {
+    entered = true
+    return blocked
+  })
+  try {
+    client.emit("session.execution.succeeded", "parent")
+    await until(() => entered, "Parent Job lookup never started")
+    // OpenCode's native child-created event has data.location, not necessarily
+    // an envelope location. It must be tracked before its async event runs.
+    client.emit("session.created", "child", {
+      parentID: "parent",
+      location: { directory: root },
+      title: "child worker",
+    }, undefined, false)
+    release([])
+    await Bun.sleep(120)
+    expect(client.writes.some(write => write.includes("LIFECYCLE_child-created parent"))).toBe(false)
+    // The child can finish, then the resumed parent may give its final answer.
+    client.emit("session.execution.succeeded", "child")
+    client.emit("session.execution.started", "parent")
+    client.emit("session.execution.succeeded", "parent")
+    await until(() => client.writes.some(write => write.includes("LIFECYCLE_child-created parent")),
+      "Final parent completion missing after native child")
   } finally {
     release([])
     await client.close()
