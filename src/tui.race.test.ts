@@ -46,8 +46,11 @@ async function exerciseRace(options: {
   const blocked = new Promise<unknown>(resolve => { release = resolve })
   const trace: string[] = []
   const emit = (id: string, type: string, eventLocation?: { directory: string }) => {
+    // The real host generates globally unique event IDs. Distinct tests must
+    // not re-use the same delivery-claim key within the shared temp directory.
+    const eventID = `${options.stall}:${options.foreignStart ? "foreign" : "local"}:${id}`
     const details = {
-      id, type,
+      id: eventID, type,
       ...(eventLocation ? { location: eventLocation } : {}),
       data: { sessionID: "parent" },
     } as OpenCodeEvent
