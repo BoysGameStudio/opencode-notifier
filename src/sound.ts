@@ -2,16 +2,20 @@ import { platform } from "os"
 import { join, dirname } from "path"
 import { fileURLToPath } from "url"
 import { existsSync } from "fs"
-import { spawn } from "child_process"
+import { spawn } from "node:child_process"
 import type { EventType } from "./config"
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const DEBOUNCE_MS = 1000
 const FULL_VOLUME_PERCENT = 100
 const FULL_VOLUME_PULSE = 65536
+const MAX_ACTIVE_PLAYBACKS = 4
+const PLAYBACK_TIMEOUT_MS = 30_000
 
 const lastSoundTime: Record<string, number> = {}
 let lastAnySoundTime = 0
+let activePlaybacks = 0
+class PlaybackTimedOut extends Error {}
 
 // One sound per second max, across all events. The per-event check alone
 // lets stacked distinct events (permission + complete) play back-to-back
@@ -73,12 +77,25 @@ async function runCommand(command: string, args: string[]): Promise<void> {
       windowsHide: true,
     })
 
-    proc.on("error", (err) => {
-      reject(err)
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try { proc.kill("SIGKILL") } catch { /* Keep the slot until the child closes. */ }
+    }, PLAYBACK_TIMEOUT_MS)
+    timer.unref()
+
+    proc.once("error", (err) => {
+      if (proc.pid === undefined) {
+        clearTimeout(timer)
+        reject(err)
+      }
     })
 
-    proc.on("close", (code) => {
-      if (code === 0) {
+    proc.once("close", (code) => {
+      clearTimeout(timer)
+      if (timedOut) {
+        reject(new PlaybackTimedOut("Audio playback timed out"))
+      } else if (code === 0) {
         resolve()
       } else {
         reject(new Error(`Command exited with code ${code}`))
@@ -136,8 +153,8 @@ async function playOnLinux(soundPath: string, volume: number): Promise<void> {
     try {
       await runCommand(player.command, player.args)
       return
-    } catch {
-      continue
+    } catch (error) {
+      if (error instanceof PlaybackTimedOut) return
     }
   }
 }
@@ -171,12 +188,13 @@ export async function playSound(
     return
   }
 
-  if (!claimSoundSlot(event)) {
+  if (activePlaybacks >= MAX_ACTIVE_PLAYBACKS || !claimSoundSlot(event)) {
     return
   }
 
   const os = platform()
 
+  activePlaybacks++
   try {
     switch (os) {
       case "darwin":
@@ -193,5 +211,7 @@ export async function playSound(
     }
   } catch {
     // Silent fail - notification will still work
+  } finally {
+    activePlaybacks--
   }
 }

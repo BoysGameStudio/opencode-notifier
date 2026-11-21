@@ -6,6 +6,7 @@ export type IdleBackground = { kind: string; sessionID: string; childSessionID?:
 type Round = {
   started: boolean
   ended?: number
+  moved?: boolean
   expected: boolean
   inboxID?: string
   resolved: boolean
@@ -53,7 +54,7 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
       for (const call of calls.values()) firstCall.set(call.parent, Math.min(firstCall.get(call.parent) ?? Infinity, call.began))
       for (const [id, owner] of parents) {
         const began = firstCall.get(owner) ?? Infinity
-        if (ancestors.has(id) || rounds.get(id)?.some(round => round.ended === undefined || round.ended > began || hasPendingResult(round, time))) continue
+        if (ancestors.has(id) || rounds.get(id)?.some(round => (round.ended ?? -Infinity) > began || !canReclaim(round, time))) continue
         parents.delete(id)
         rounds.delete(id)
         break
@@ -77,7 +78,7 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
     const round: Round = { started, expected: false, resolved: false }
     if (history.length >= 32) {
       const time = now()
-      const retired = history.findIndex(item => item.resolved || (item.ended !== undefined && !hasPendingResult(item, time)))
+      const retired = history.findIndex(item => canReclaim(item, time))
       if (retired === -1) {
         markUncertain(parent)
         return
@@ -110,7 +111,16 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
   }
 
   function hasPendingResult(round: Round, time: number) {
-    return !round.resolved && (round.expected || !!round.inboxID || (round.inferredUntil ?? 0) > time)
+    return !round.resolved && (round.expected || !!round.inboxID || (round.inferredUntil ?? -Infinity) > time)
+  }
+
+  function canReclaim(round: Round, time: number) {
+    return round.resolved || (round.ended !== undefined && !hasPendingResult(round, time))
+  }
+
+  function clearCalls(sessionID: string) {
+    for (const [key, call] of calls) if (call.parent === sessionID) calls.delete(key)
+    for (const key of inputs) if (key.startsWith(`${sessionID}\0`)) inputs.delete(key)
   }
 
   return {
@@ -121,22 +131,29 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
       }
       return backgroundEvents.has(event.type)
     },
+    knowsChild(sessionID: string, parentID?: string) {
+      return parentID === undefined ? parents.has(sessionID) : parents.get(sessionID) === parentID
+    },
     movedAway(sessionID: string) {
       const round = rounds.get(sessionID)?.at(-1)
       // The result still belongs to the parent, although this location may
       // no longer see the child's terminal event.
-      if (round && round.ended === undefined) round.ended = ++order
+      if (round && round.ended === undefined) {
+        round.ended = ++order
+        round.moved = true
+      }
+      // A session move preserves its inbox and the native Jobs it owns.
     },
     idle(sessionID: string, background: readonly IdleBackground[]) {
       for (const work of background) {
         if (work.kind !== "subagent" || typeof work.childSessionID !== "string") continue
         let round = rounds.get(work.childSessionID)?.at(-1)
         if (round?.ended !== undefined) {
-          // The idle snapshot may have been taken before the terminal event.
-          if (!round.resolved) round.expected = true
-        } else {
-          round = expect(work.sessionID, work.childSessionID, order)
-        }
+          // The hook receives a snapshot taken before other hooks run. It
+          // identifies the child session but cannot distinguish Job rounds.
+          if (round.resolved || (reportsDirectChildren && !round.moved && !round.expected && !round.inboxID && round.inferredUntil === undefined)) continue
+          round.expected = true
+        } else round = expect(work.sessionID, work.childSessionID, order)
         if (!round && !belongsTo(work.sessionID, sessionID)) markUncertain(sessionID)
         if (round && !round.resolved && !belongsTo(work.sessionID, sessionID)) {
           (round.observedFor ??= new Set()).add(sessionID)
@@ -177,17 +194,18 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
         case "session.execution.failed":
         case "session.execution.interrupted": {
           const child = event.data.sessionID
+          clearCalls(child)
           const history = rounds.get(child)
           const last = history?.at(-1)
           if (!history || !last || last.ended !== undefined) break
           last.ended = at
           // A newer settlement follows the previous round's live admission
-          // attempt. Retire earlier guesses whose reports never entered the
-          // inbox. An observed Job or queued report still needs its own ack.
+          // attempt. Retire earlier guesses. A confirmed Job can still have
+          // an unadmitted outbox report and stays pending.
           if (reportsDirectChildren && last.started) {
             for (const item of history) {
               if (item === last) break
-              if (!item.expected && !item.inboxID && item.inferredUntil !== undefined) item.resolved = true
+              if (!item.expected && !item.inboxID) item.resolved = true
             }
           }
           // OpenCode 2.3 reports direct child turns too. Automation children
@@ -196,7 +214,7 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
             : event.type === "session.execution.failed" || event.data.reason !== "shutdown"
           if (reportsDirectChildren && last.started && !child.startsWith("ses_aut_") && expectsReport && !last.expected) {
             last.inferredUntil = now() + uncertaintyTimeout()
-          }
+          } else if (!last.expected && !last.inboxID) last.inferredUntil = undefined
           break
         }
         case "session.tool.input.started": {
@@ -207,9 +225,11 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
           break
         }
         case "session.tool.called": {
-          const { sessionID, assistantMessageID, id, executed } = event.data
+          const { sessionID, assistantMessageID, id } = event.data
           const key = `${sessionID}\0${assistantMessageID}\0${id}`
-          if (inputs.delete(key) && executed) remember(calls, key, { parent: sessionID, began: at }, sessionID)
+          // `executed` identifies provider execution. OpenCode's local tool
+          // events use false here and still launch a native Subagent Job.
+          if (inputs.delete(key)) remember(calls, key, { parent: sessionID, began: at }, sessionID)
           break
         }
         case "session.tool.success":
@@ -233,12 +253,15 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
           const history = rounds.get(child)
           if (inbox.has(inboxID) || history?.some(round => round.inboxID === inboxID)) break
           if (!rememberParent(child, sessionID)) break
-          // Prefer a pending settlement. An actual late admission remains
-          // outstanding even if no tracked round currently expects it.
+          // Modern OpenCode attempts admission before a successor starts.
+          // A newer result must not acknowledge an older Job whose outbox
+          // admission failed. Keep the older confirmed expectation pending.
           const time = now()
-          const round = history?.find(item => item.ended !== undefined && !item.inboxID && hasPendingResult(item, time))
-            ?? history?.filter(item => !item.resolved && item.ended !== undefined && !item.inboxID).at(-1)
-            ?? history?.find(item => item.expected && !item.started && !item.inboxID)
+          const settled = history?.filter(item => !item.resolved && item.ended !== undefined && !item.inboxID)
+          const preferred = reportsDirectChildren ? settled?.at(-1) : settled?.find(item => hasPendingResult(item, time))
+          const unstarted = history?.filter(item => !item.started && item.ended === undefined && hasPendingResult(item, time)).at(-1)
+          const round = (preferred && hasPendingResult(preferred, time) ? preferred : unstarted ?? preferred)
+            ?? settled?.at(-1)
             ?? add(child, sessionID, false)
           if (!round) break
           round.ended ??= at
@@ -272,8 +295,7 @@ export function createBackgroundObserver({ reportsDirectChildren = false, now = 
               if (round.inboxID) inbox.delete(round.inboxID)
             }
           }
-          for (const [key, call] of calls) if (call.parent === id) calls.delete(key)
-          for (const key of inputs) if (key.startsWith(`${id}\0`)) inputs.delete(key)
+          clearCalls(id)
           break
         }
       }

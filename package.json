@@ -22,7 +22,7 @@
     "gnome-shell-extension"
   ],
   "scripts": {
-    "build": "bun build src/index.ts src/tui.ts --outdir dist --target node --external node-notifier --external @particle/dbus-next && tsc --emitDeclarationOnly",
+    "build": "bun build src/index.ts src/tui.ts --outdir dist --target node --external node-notifier --external @particle/dbus-next && tsc --emitDeclarationOnly && bun -e \"const { copyFile } = await import('node:fs/promises'); await copyFile('src/v2-inbox-worker.js', 'dist/v2-inbox-worker.js'); await copyFile('src/v2-inbox.bunfig.toml', 'dist/v2-inbox.bunfig.toml')\"",
     "prepublishOnly": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test"

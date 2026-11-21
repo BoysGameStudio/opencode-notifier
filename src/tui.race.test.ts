@@ -65,6 +65,10 @@ async function exerciseRace(options: {
     dispose = await tui.setup({
       location,
       client: {
+        rpc: () => ({ inboxFamily: async ({ sessionID }: { sessionID: string }) => {
+          trace.push("inbox metadata")
+          return { sessions: [{ id: sessionID, idle: null }], items: [] }
+        } }),
         session: {
           async get({ sessionID }: { sessionID: string }) {
             gets++
@@ -72,10 +76,6 @@ async function exerciseRace(options: {
             if (options.stall === "ownership" && gets === 1) return blocked
             return { id: sessionID, title: "parent task", location }
           },
-          inbox: { list: async () => {
-            trace.push("inbox")
-            return []
-          } },
         },
         experimental: { job: {
           async list() {

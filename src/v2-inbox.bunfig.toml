@@ -1,0 +1,3 @@
+# The build copies these settings and the worker together into dist.
+preload = []
+env = false

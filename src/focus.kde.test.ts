@@ -32,7 +32,11 @@ const xdotoolDirectory = join(directory, "xdotool-only")
 mkdirSync(xdotoolDirectory)
 writeFileSync(join(xdotoolDirectory, "xdotool"), `#!${process.execPath}
 import { readFileSync } from "fs"
-if (process.argv[2] === "getactivewindow") console.log(readFileSync(${JSON.stringify(activePath)}, "utf8"))
+if (process.argv[2] === "getactivewindow") {
+  const active = readFileSync(${JSON.stringify(activePath)}, "utf8")
+  if (active === "stalled") await Bun.sleep(5000)
+  else console.log(active)
+}
 `)
 chmodSync(join(xdotoolDirectory, "xdotool"), 0o755)
 
@@ -71,9 +75,9 @@ test.skipIf(process.platform !== "linux")("KDE UUID identifies an embedded termi
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
     console.log(process.env.OPENCODE_NOTIFIER_WINDOW_ID ?? "unmodified")
-    console.log(focus.isTerminalFocused(), focus.getCachedWindowTitle())
+    console.log(await focus.isTerminalFocused(), focus.getCachedWindowTitle())
     writeFileSync(${JSON.stringify(activePath)}, ${JSON.stringify(otherID)})
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
     await focus.focusTerminal()
   `)
   expect(result.output).toBe(`unmodified\ntrue Obsidian — vault\nfalse`)
@@ -86,9 +90,9 @@ test.skipIf(process.platform !== "linux")("an explicit embedded host window is u
     import { writeFileSync } from "fs"
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
     writeFileSync(${JSON.stringify(activePath)}, ${JSON.stringify(otherID)})
-    console.log(focus.isTerminalFocused(), focus.getCachedWindowTitle())
+    console.log(await focus.isTerminalFocused(), focus.getCachedWindowTitle())
     await focus.focusTerminal()
   `, otherID)
   expect(result.output).toBe("false\ntrue Obsidian — vault")
@@ -110,9 +114,9 @@ test.skipIf(process.platform !== "linux")("a background VS Code terminal targets
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
     console.log(process.env.OPENCODE_NOTIFIER_WINDOW_ID ?? "unmodified")
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
     writeFileSync(${JSON.stringify(activePath)}, ${JSON.stringify(otherID)})
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
     await focus.focusTerminal()
   `, undefined, true)
   expect(result.output).toBe("unmodified\nfalse\ntrue")
@@ -125,7 +129,7 @@ test.skipIf(process.platform !== "linux")("ambiguous VS Code windows fail open a
   const result = await run(`
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
-    console.log(focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
+    console.log(await focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
     await focus.focusTerminal()
   `, undefined, true, { hostWindows: `${otherID}\n${thirdID}` })
   expect(result.output).toBe("false false")
@@ -137,7 +141,7 @@ test.skipIf(process.platform !== "linux")("an unresolved KDE host is not treated
   const result = await run(`
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
   `, undefined, true, { hostWindows: `${otherID}\n${thirdID}`, active: windowID, env: { TMUX: "/tmp/fixture,1,0", TMUX_PANE: "%1" } })
   expect(result.output).toBe("false")
 })
@@ -147,23 +151,28 @@ test.skipIf(process.platform !== "linux")("KDE X11 compares the captured KWin ID
     import { writeFileSync } from "fs"
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
     writeFileSync(${JSON.stringify(activePath)}, ${JSON.stringify(otherID)})
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
   `, undefined, false, { env: { WAYLAND_DISPLAY: undefined, DISPLAY: ":0" } })
   expect(result.output).toBe("true\nfalse")
 })
 
-test.skipIf(process.platform !== "linux")("KDE X11 without kdotool keeps xdotool focus suppression", async () => {
+test.skipIf(process.platform !== "linux")("KDE X11 without kdotool checks xdotool focus without blocking the event loop", async () => {
   writeFileSync(callsPath, "")
   writeFileSync(activePath, "4194307")
   const child = Bun.spawn([process.execPath, "--eval", `
     import { writeFileSync } from "fs"
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
     writeFileSync(${JSON.stringify(activePath)}, "4194999")
-    console.log(focus.isTerminalFocused())
+    console.log(await focus.isTerminalFocused())
+    writeFileSync(${JSON.stringify(activePath)}, "stalled")
+    const probe = focus.isTerminalFocused().then(value => console.log(value))
+    await Bun.sleep(20)
+    console.log("host still responsive")
+    await probe
   `], {
     env: {
       ...process.env, PATH: xdotoolDirectory, DISPLAY: ":0", KDE_SESSION_VERSION: "6", WAYLAND_DISPLAY: undefined,
@@ -174,14 +183,14 @@ test.skipIf(process.platform !== "linux")("KDE X11 without kdotool keeps xdotool
   const output = await new Response(child.stdout).text()
   const error = await new Response(child.stderr).text()
   expect(await child.exited, error).toBe(0)
-  expect(output.trim()).toBe("true\nfalse")
+  expect(output.trim()).toBe("true\nfalse\nhost still responsive\nfalse")
 })
 
 test.skipIf(process.platform !== "linux")("the active VS Code window resolves multiple windows owned by its ancestor", async () => {
   const result = await run(`
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
-    console.log(focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
+    console.log(await focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
     await focus.focusTerminal()
   `, undefined, true, { hostWindows: `${windowID}\n${otherID}`, active: otherID })
   expect(result.output).toBe("true true")
@@ -192,7 +201,7 @@ test.skipIf(process.platform !== "linux")("a known host with no window never cap
   const result = await run(`
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
-    console.log(focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
+    console.log(await focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
     await focus.focusTerminal()
   `, undefined, true, { hostWindows: "", active: otherID })
   expect(result.output).toBe("false false")
@@ -213,7 +222,7 @@ test.skipIf(process.platform !== "linux")("without ancestry, TERM_PROGRAM reject
   const result = await run(`
     const focus = await import(${JSON.stringify(modulePath)})
     await focus.captureStartupWindowId()
-    console.log(focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
+    console.log(await focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
     await focus.focusTerminal()
   `, undefined, false, { termProgram: "vscode" })
   expect(result.output).toBe("false false")
@@ -226,7 +235,7 @@ test.skipIf(process.platform !== "linux")("V1 and V2 terminal setup await host c
       const {default: plugin} = await import(${JSON.stringify(import.meta.dir)} + "/${host}")
       const dispose = ${host === "index.ts" ? `await plugin.server({client:{},directory:${JSON.stringify(directory)}})` : `await plugin.setup({client:{},location:{directory:${JSON.stringify(directory)}},data:{listen(){return () => {}}}})`}
       const focus = await import(${JSON.stringify(modulePath)})
-      console.log(focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
+      console.log(await focus.isTerminalFocused(), focus.isTerminalJumpBackSupported())
       await focus.focusTerminal()
       ${host === "index.ts" ? "await dispose.dispose?.()" : "await dispose?.()"}
     `, undefined, true)

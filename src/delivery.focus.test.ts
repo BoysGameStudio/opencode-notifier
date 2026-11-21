@@ -8,7 +8,7 @@ afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }))
 
 // Runs handleEvent in a child process with the terminal reported as focused and every channel stubbed,
 // so module mocks never leak into other test files. Returns the channels that delivered.
-async function deliveredWhileFocused(suppressWhenFocused: unknown): Promise<string[]> {
+async function deliveredWhileFocused(suppressWhenFocused: unknown, concurrent = false): Promise<string[]> {
   const configPath = join(fixtureRoot, "config.json")
   writeFileSync(configPath, JSON.stringify({
     suppressWhenFocused, bell: true,
@@ -19,16 +19,16 @@ async function deliveredWhileFocused(suppressWhenFocused: unknown): Promise<stri
     const { mock } = await import("bun:test")
     const log = (line) => process.stdout.write(line + "\\n")
     mock.module(${module("focus.ts")}, () => ({
-      isTerminalFocused: () => (log("focus-query"), true),
+      isTerminalFocused: async () => { log("focus-query"); await Bun.sleep(10); return true },
       focusTerminal: async () => {}, isTerminalJumpBackSupported: () => false, debugFocusState: () => {},
     }))
-    mock.module(${module("notify.ts")}, () => ({ sendNotification: async () => log("notification") }))
+    mock.module(${module("notify.ts")}, () => ({ sendNotification: async () => log("notification"), usesLinuxDesktopNotifications: () => false }))
     mock.module(${module("sound.ts")}, () => ({ playSound: async () => log("sound") }))
     mock.module(${module("bell.ts")}, () => ({ ringBell: async () => log("bell") }))
     mock.module(${module("command.ts")}, () => ({ runCommand: () => log("command") }))
     const { loadConfig } = await import(${module("config.ts")})
     const { handleEvent } = await import(${module("delivery.ts")})
-    await handleEvent(loadConfig(), "complete", "project")
+    await Promise.all(Array.from({ length: ${concurrent ? 12 : 1} }, () => handleEvent(loadConfig(), "complete", "project")))
   `
   const child = Bun.spawn([process.execPath, "--eval", script], {
     env: { ...process.env, OPENCODE_NOTIFIER_CONFIG_PATH: configPath },
@@ -41,6 +41,10 @@ async function deliveredWhileFocused(suppressWhenFocused: unknown): Promise<stri
 
 test("suppressWhenFocused true skips every channel while focused", async () => {
   expect(await deliveredWhileFocused(true)).toEqual(["focus-query"])
+})
+
+test("concurrent deliveries share the first focus query", async () => {
+  expect(await deliveredWhileFocused(true, true)).toEqual(["focus-query"])
 })
 
 test("suppressWhenFocused false delivers every channel without querying focus", async () => {

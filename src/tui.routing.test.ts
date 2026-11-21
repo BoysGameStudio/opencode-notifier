@@ -25,6 +25,7 @@ async function startClient(directory: string, name: string, openSessions: string
     }))
     mock.module(${module("notify.ts")}, () => ({
       sendNotification: async (...args) => {output.push("popup:${name}"); click = args[6]},
+      usesLinuxDesktopNotifications: () => false,
       disposeLinuxNotifications: () => {},
     }))
     const {default: plugin} = await import(${module("tui.ts")})

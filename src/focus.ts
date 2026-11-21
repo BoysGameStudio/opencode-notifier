@@ -57,9 +57,9 @@ function execFileWithTimeout(command: string, args: readonly string[], timeoutMs
   }
 }
 
-function execFileAsync(command: string, args: readonly string[], timeout = 500): Promise<string | null> {
+function execFileAsync(command: string, args: readonly string[], timeout = 500, signal?: AbortSignal): Promise<string | null> {
   return new Promise(resolve => {
-    execFile(command, args, { timeout, encoding: "utf-8", windowsHide: true }, (error, stdout) => {
+    execFile(command, args, { timeout, signal, killSignal: "SIGKILL", encoding: "utf-8", windowsHide: true }, (error, stdout) => {
       resolve(error ? null : stdout.trim())
     })
   })
@@ -95,8 +95,8 @@ function firstNumericWindowId(output: string | null): string | null {
   return value ?? null
 }
 
-function getHyprlandActiveWindowId(): string | null {
-  const output = execWithTimeout("hyprctl activewindow -j")
+async function getHyprlandActiveWindowId(signal: AbortSignal): Promise<string | null> {
+  const output = await execFileAsync("hyprctl", ["activewindow", "-j"], 500, signal)
   if (!output) return null
   try {
     const data = JSON.parse(output)
@@ -128,8 +128,8 @@ function findFocusedWindowId(node: any): string | null {
   return null
 }
 
-function getSwayActiveWindowId(): string | null {
-  const output = execWithTimeout("swaymsg -t get_tree", 1000)
+async function getSwayActiveWindowId(signal: AbortSignal): Promise<string | null> {
+  const output = await execFileAsync("swaymsg", ["-t", "get_tree"], 1000, signal)
   if (!output) return null
   try {
     const tree = JSON.parse(output)
@@ -139,8 +139,8 @@ function getSwayActiveWindowId(): string | null {
   }
 }
 
-function getNiriActiveWindowId(): string | null {
-  const output = execWithTimeout("niri msg --json focused-window", 1000)
+async function getNiriActiveWindowId(signal: AbortSignal): Promise<string | null> {
+  const output = await execFileAsync("niri", ["msg", "--json", "focused-window"], 1000, signal)
   if (!output) return null
   try {
     const data = JSON.parse(output)
@@ -165,13 +165,13 @@ export function parseWezTermFocusedPaneId(output: string): string | null {
   }
 }
 
-function getLinuxWaylandActiveWindowId(): string | null {
+async function getLinuxWaylandActiveWindowId(signal: AbortSignal): Promise<string | null> {
   const env = process.env
-  if (env.HYPRLAND_INSTANCE_SIGNATURE) return getHyprlandActiveWindowId()
-  if (env.NIRI_SOCKET) return getNiriActiveWindowId()
-  if (env.SWAYSOCK) return getSwayActiveWindowId()
-  if (env.KDE_SESSION_VERSION) return firstKDEWindowId(execWithTimeout("kdotool getactivewindow"))
-  if (isGnomeLikeSession(env)) return getGnomeShellWindowKey() ?? getGnomeAtspiActiveWindowKey()
+  if (env.HYPRLAND_INSTANCE_SIGNATURE) return getHyprlandActiveWindowId(signal)
+  if (env.NIRI_SOCKET) return getNiriActiveWindowId(signal)
+  if (env.SWAYSOCK) return getSwayActiveWindowId(signal)
+  if (env.KDE_SESSION_VERSION) return firstKDEWindowId(await execFileAsync("kdotool", ["getactivewindow"], 500, signal))
+  if (isGnomeLikeSession(env)) return await getGnomeShellWindowKey(signal) ?? getGnomeAtspiActiveWindowKey(signal)
   return null
 }
 
@@ -270,26 +270,27 @@ export function isAtspiWindowRoleAccepted(role: string | null): boolean {
 }
 
 function callAtspi(
+  signal: AbortSignal,
   address: string,
   dest: string,
   path: string,
   method: string,
   args: readonly string[] = [],
   timeoutMs: number = 500
-): string | null {
-  return execFileWithTimeout("gdbus", [
+): Promise<string | null> {
+  return execFileAsync("gdbus", [
     "call", "--address", address,
     "--dest", dest,
     "--object-path", path,
     "--method", method,
     ...args,
-  ], timeoutMs)
+  ], timeoutMs, signal)
 }
 
 let cachedAtspiAddress: { address: string; at: number } | null = null
 const ATSPI_ADDRESS_CACHE_TTL_MS = 10_000
 
-function getAtspiBusAddress(): string | null {
+async function getAtspiBusAddress(signal: AbortSignal): Promise<string | null> {
   const now = Date.now()
   if (cachedAtspiAddress && now - cachedAtspiAddress.at < ATSPI_ADDRESS_CACHE_TTL_MS) {
     return cachedAtspiAddress.address
@@ -297,12 +298,12 @@ function getAtspiBusAddress(): string | null {
   // The session bus address is stable, but a stale cache must never hard-fail
   // detection: every caller treats null as "unknown" and fails open.
   cachedAtspiAddress = null
-  const output = execFileWithTimeout("gdbus", [
+  const output = await execFileAsync("gdbus", [
     "call", "--session",
     "--dest", "org.a11y.Bus",
     "--object-path", "/org/a11y/bus",
     "--method", "org.a11y.Bus.GetAddress",
-  ], 1000)
+  ], 1000, signal)
   const address = parseAtspiString(output)
   if (address) {
     cachedAtspiAddress = { address, at: now }
@@ -310,19 +311,20 @@ function getAtspiBusAddress(): string | null {
   return address
 }
 
-function getAtspiWindowRole(address: string, ref: AtspiObjectRef): string | null {
-  const output = callAtspi(address, ref.bus, ref.path, "org.a11y.atspi.Accessible.GetRoleName")
+async function getAtspiWindowRole(signal: AbortSignal, address: string, ref: AtspiObjectRef): Promise<string | null> {
+  const output = await callAtspi(signal, address, ref.bus, ref.path, "org.a11y.atspi.Accessible.GetRoleName")
   return parseAtspiString(output)
 }
 
-function isAtspiWindowActive(address: string, ref: AtspiObjectRef): boolean | null {
-  const output = callAtspi(address, ref.bus, ref.path, "org.a11y.atspi.Accessible.GetState")
+async function isAtspiWindowActive(signal: AbortSignal, address: string, ref: AtspiObjectRef): Promise<boolean | null> {
+  const output = await callAtspi(signal, address, ref.bus, ref.path, "org.a11y.atspi.Accessible.GetState")
   return parseAtspiStateActive(output)
 }
 
-function getAtspiTerminalWindowRefs(address: string): AtspiObjectRef[] {
+async function getAtspiTerminalWindowRefs(signal: AbortSignal, address: string): Promise<AtspiObjectRef[]> {
   const refs: AtspiObjectRef[] = []
-  const rootOutput = callAtspi(
+  const rootOutput = await callAtspi(
+    signal,
     address,
     "org.a11y.atspi.Registry",
     "/org/a11y/atspi/accessible/root",
@@ -331,17 +333,20 @@ function getAtspiTerminalWindowRefs(address: string): AtspiObjectRef[] {
     1000
   )
   for (const app of parseAtspiObjectRefs(rootOutput)) {
-    const appName = parseAtspiString(callAtspi(
+    signal.throwIfAborted()
+    const appName = parseAtspiString(await callAtspi(
+      signal,
       address,
       app.bus,
       "/org/a11y/atspi/accessible/root",
       "org.freedesktop.DBus.Properties.Get",
       ["org.a11y.atspi.Accessible", "Name"]
     ))
-    const childrenOutput = callAtspi(address, app.bus, app.path, "org.a11y.atspi.Accessible.GetChildren")
+    const childrenOutput = await callAtspi(signal, address, app.bus, app.path, "org.a11y.atspi.Accessible.GetChildren")
     for (const child of parseAtspiObjectRefs(childrenOutput)) {
       if (!isAtspiTerminalWindow(appName, child.path)) continue
-      const role = getAtspiWindowRole(address, child)?.toLowerCase() ?? null
+      signal.throwIfAborted()
+      const role = (await getAtspiWindowRole(signal, address, child))?.toLowerCase() ?? null
       if (isAtspiWindowRoleAccepted(role)) {
         refs.push(child)
       }
@@ -350,12 +355,13 @@ function getAtspiTerminalWindowRefs(address: string): AtspiObjectRef[] {
   return refs
 }
 
-export function getGnomeAtspiActiveWindowKey(): string | null {
+async function getGnomeAtspiActiveWindowKey(signal: AbortSignal): Promise<string | null> {
   try {
-    const address = getAtspiBusAddress()
+    const address = await getAtspiBusAddress(signal)
     if (!address) return null
-    for (const ref of getAtspiTerminalWindowRefs(address)) {
-      if (isAtspiWindowActive(address, ref) === true) {
+    for (const ref of await getAtspiTerminalWindowRefs(signal, address)) {
+      signal.throwIfAborted()
+      if (await isAtspiWindowActive(signal, address, ref) === true) {
         // AT-SPI object paths are only unique within their D-Bus bus name
         // (e.g. every app exposes `/org/a11y/atspi/accessible/1`), so the
         // key must include the bus name to stay globally unique across
@@ -373,15 +379,15 @@ export function getGnomeAtspiActiveWindowKey(): string | null {
 const GNOME_BRIDGE_INTERFACE = "org.gnome.Shell.Extensions.OpenCodeNotifier"
 const GNOME_BRIDGE_PATH = "/org/gnome/Shell/Extensions/OpenCodeNotifier"
 
-function callGnomeBridge(method: "CaptureWindow" | "ActivateWindow", args: readonly string[] = []): string | null {
-  return execFileWithTimeout("gdbus", [
+function gnomeBridgeArgs(method: "CaptureWindow" | "ActivateWindow", args: readonly string[] = []): string[] {
+  return [
     "call", "--session", "--dest", "org.gnome.Shell", "--object-path", GNOME_BRIDGE_PATH,
     "--method", `${GNOME_BRIDGE_INTERFACE}.${method}`, ...args,
-  ], 1000)
+  ]
 }
 
-function getGnomeShellWindowKey(): string | null {
-  const id = parseAtspiString(callGnomeBridge("CaptureWindow"))
+async function getGnomeShellWindowKey(signal: AbortSignal): Promise<string | null> {
+  const id = parseAtspiString(await execFileAsync("gdbus", gnomeBridgeArgs("CaptureWindow"), 1000, signal))
   return id && /^[0-9a-f-]{36}:\d+$/.test(id) ? `gnome:${id}` : null
 }
 
@@ -504,26 +510,23 @@ export function isMacTerminalAppFocused(frontmostAppName: string | null, env: No
   return expectedApps.has(normalizedFrontmost)
 }
 
-function getActiveWindowId(): string | null {
-  const platform = process.platform
-  if (platform === "darwin") return getMacOSActiveWindowId()
-  if (platform === "linux") {
-    // KWin IDs from kdotool must match the startup capture on X11 too, where xdotool reports numeric IDs.
-    if (process.env.KDE_SESSION_VERSION && isKDEJumpBackSupported()) return firstKDEWindowId(execWithTimeout("kdotool getactivewindow"))
-    if (process.env.WAYLAND_DISPLAY) return getLinuxWaylandActiveWindowId()
-    if (process.env.DISPLAY) return firstNumericWindowId(execWithTimeout("xdotool getactivewindow"))
-    return null
-  }
-  if (platform === "win32") return null
+const LINUX_FOCUS_TIMEOUT_MS = 2000
+
+async function getLinuxActiveWindowId(signal: AbortSignal): Promise<string | null> {
+  // KWin IDs from kdotool must match the startup capture on X11 too.
+  if (process.env.KDE_SESSION_VERSION && cachedKDEJumpBackSupport)
+    return firstKDEWindowId(await execFileAsync("kdotool", ["getactivewindow"], 500, signal))
+  if (process.env.WAYLAND_DISPLAY) return getLinuxWaylandActiveWindowId(signal)
+  if (process.env.DISPLAY) return firstNumericWindowId(await execFileAsync("xdotool", ["getactivewindow"], 500, signal))
   return null
 }
 
 // KDE capture is awaited by the terminal's setup. Import-time foreground
 // capture can belong to another app when clients start or reload in background.
-let cachedWindowId: string | null =
-  process.platform === "linux" && process.env.KDE_SESSION_VERSION
-    ? null
-    : getActiveWindowId()
+let cachedWindowId = process.platform === "darwin" ? getMacOSActiveWindowId() : null
+let startupWindowCapture = process.platform === "linux" && !process.env.KDE_SESSION_VERSION
+  ? getLinuxActiveWindowId(AbortSignal.timeout(LINUX_FOCUS_TIMEOUT_MS)).then(id => { cachedWindowId = id }, () => {})
+  : undefined
 
 let cachedWindowTitleValue: string | null | undefined
 
@@ -556,11 +559,11 @@ export function isZellijPaneFocused(paneID: string | null | undefined, clientsOu
   })
 }
 
-function isZellijPaneActive(): boolean {
+async function isZellijPaneActive(signal?: AbortSignal): Promise<boolean> {
   const session = process.env.ZELLIJ_SESSION_NAME
   const pane = process.env.ZELLIJ_PANE_ID
   if (!session || !pane) return false
-  return isZellijPaneFocused(pane, execFileWithTimeout("zellij", ["--session", session, "action", "list-clients"], 1000))
+  return isZellijPaneFocused(pane, await execFileAsync("zellij", ["--session", session, "action", "list-clients"], 1000, signal))
 }
 
 export function isLinuxTerminalFocused(params: {
@@ -589,32 +592,34 @@ export function isLinuxTerminalFocused(params: {
   return true
 }
 
-function isTmuxPaneActive(): boolean {
+async function isTmuxPaneActive(signal?: AbortSignal): Promise<boolean> {
   const tmuxPane = process.env.TMUX_PANE ?? null
-  const result = execFileWithTimeout("tmux", ["display-message", "-t", tmuxPane ?? "", "-p", "#{session_attached} #{window_active} #{pane_active}"])
+  const result = await execFileAsync("tmux", ["display-message", "-t", tmuxPane ?? "", "-p", "#{session_attached} #{window_active} #{pane_active}"], 500, signal)
   return isTmuxPaneFocused(tmuxPane, result)
 }
 
-function isWezTermPaneActive(): boolean {
+async function isWezTermPaneActive(signal?: AbortSignal): Promise<boolean> {
   const weztermPane = process.env.WEZTERM_PANE ?? null
   if (!weztermPane) return true
-  const output = execFileWithTimeout("wezterm", ["cli", "list-clients", "--format", "json"], 1000)
+  const output = await execFileAsync("wezterm", ["cli", "list-clients", "--format", "json"], 1000, signal)
   if (!output) return false
   const focusedPaneId = parseWezTermFocusedPaneId(output)
   if (!focusedPaneId) return false
   return focusedPaneId === weztermPane
 }
 
-export function isTerminalFocused(): boolean {
+export async function isTerminalFocused(): Promise<boolean> {
   try {
-    const zellijPaneActive = process.env.ZELLIJ_SESSION_NAME || process.env.ZELLIJ_PANE_ID ? isZellijPaneActive() : null
+    await startupWindowCapture
+    const signal = process.platform === "linux" ? AbortSignal.timeout(LINUX_FOCUS_TIMEOUT_MS) : undefined
+    const zellijPaneActive = process.env.ZELLIJ_SESSION_NAME || process.env.ZELLIJ_PANE_ID ? await isZellijPaneActive(signal) : null
     if (zellijPaneActive === false) return false
     if (process.platform === "darwin") {
       const frontmostAppName = getMacOSFrontmostAppName()
       if (!isMacTerminalAppFocused(frontmostAppName, process.env)) {
         return false
       }
-      if (!isWezTermPaneActive()) {
+      if (!(await isWezTermPaneActive())) {
         return false
       }
       if (process.env.TMUX) {
@@ -626,17 +631,21 @@ export function isTerminalFocused(): boolean {
     if (process.platform === "win32") return isWindowsHostFocused()
 
     // An unresolved KDE host must not let a focused tmux or Zellij pane stand in for desktop focus.
-    if (!cachedWindowId && isKDEJumpBackSupported()) {
+    if (!cachedWindowId && process.env.KDE_SESSION_VERSION &&
+        (cachedKDEJumpBackSupport ?? (await execFileAsync("kdotool", ["--help"], 1000, signal) !== null))) {
       debugFocusState("linux focus: KDE originating window is unknown, notifying")
       return false
     }
     const ssh = !!(process.env.SSH_CONNECTION || process.env.SSH_TTY)
-    const tmuxPaneActive = process.env.TMUX ? isTmuxPaneActive() : null
-    const currentWindowId = getActiveWindowId()
+    const [tmuxPaneActive, currentWindowId, wezTermPaneActive] = await Promise.all([
+      process.env.TMUX ? isTmuxPaneActive(signal) : null,
+      signal && cachedWindowId ? getLinuxActiveWindowId(signal) : null,
+      isWezTermPaneActive(signal),
+    ])
     const focused = isLinuxTerminalFocused({
       cachedWindowId,
       currentWindowId,
-      wezTermPaneActive: isWezTermPaneActive(),
+      wezTermPaneActive,
       tmuxPaneActive,
       zellijPaneActive,
       ssh,
@@ -946,14 +955,14 @@ function focusLinuxWindowNiri(windowId: string): void {
   }
 }
 
-let startupWindowCapture: Promise<void> | undefined
-
 export async function captureStartupWindowId(): Promise<void> {
-  if (process.platform !== "linux" || !process.env.KDE_SESSION_VERSION) return
+  if (process.platform !== "linux") return
+  if (!process.env.KDE_SESSION_VERSION) return startupWindowCapture
   startupWindowCapture ??= (async () => {
     cachedKDEJumpBackSupport = await execFileAsync("kdotool", ["--help"], 1000) !== null
     // Without kdotool, keep the foreground capture (xdotool on X11) used before host resolution.
-    cachedWindowId = cachedKDEJumpBackSupport ? await getKDEStartupWindowId() : getActiveWindowId()
+    cachedWindowId = cachedKDEJumpBackSupport ? await getKDEStartupWindowId()
+      : await getLinuxActiveWindowId(AbortSignal.timeout(LINUX_FOCUS_TIMEOUT_MS))
     cachedWindowTitleValue = undefined
     // Do not write an automatically captured ID into process.env. It can be
     // inherited by another client or mistaken for a user override on reload.
@@ -984,9 +993,10 @@ export async function focusTerminal(): Promise<void> {
   }
 
   if (process.platform === "linux") {
+    await startupWindowCapture
     const env = process.env
     if (env.WAYLAND_DISPLAY && isGnomeLikeSession(env) && cachedWindowId?.startsWith("gnome:")) {
-      const result = callGnomeBridge("ActivateWindow", [cachedWindowId.slice("gnome:".length)])
+      const result = await execFileAsync("gdbus", gnomeBridgeArgs("ActivateWindow", [cachedWindowId.slice("gnome:".length)]), 1000)
       debugFocusState(`GNOME jump-back ActivateWindow ${cachedWindowId} -> ${result ?? "null"}`)
       if (result !== "(true,)") debugFocusState("GNOME jump-back could not activate the captured window")
       return

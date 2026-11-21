@@ -13,7 +13,8 @@ import {
   CHANNELS,
 } from "./config"
 import type { Channel, EventType, MessageContext, NotifierConfig } from "./config"
-import { sendNotification } from "./notify"
+import { sendNotification, usesLinuxDesktopNotifications } from "./notify"
+import { nextLinuxNotificationOrder } from "./notify-linux"
 import { playSound } from "./sound"
 import { ringBell } from "./bell"
 import { runCommand } from "./command"
@@ -95,6 +96,23 @@ export function deliversAny(config: NotifierConfig, eventType: EventType): boole
   return CHANNELS.some(channel => config.events[eventType][channel] && (channel !== "command" || config.command.enabled))
 }
 
+export function queuedLinuxPrompt(config: NotifierConfig, event: EventType): "popup-only" | "mixed" | undefined {
+  if ((event !== "permission" && event !== "question") || !usesLinuxDesktopNotifications(config.notificationSystem) ||
+      !isEventNotificationEnabled(config, event)) return
+  return isEventSoundEnabled(config, event) || isEventBellEnabled(config, event) || (config.command.enabled && isEventCommandEnabled(config, event))
+    ? "mixed" : "popup-only"
+}
+
+export type PopupCheck = { permit?: (current: () => boolean) => Promise<boolean>; deferFocus?: boolean }
+
+let channelFocusProbe: Promise<boolean> | undefined
+
+function channelIsFocused(): Promise<boolean> {
+  // Concurrent alerts can share the first focus snapshot. Each queued popup
+  // still takes a fresh snapshot just before sending.
+  return channelFocusProbe ??= Promise.resolve(isTerminalFocused()).finally(() => { channelFocusProbe = undefined })
+}
+
 export async function handleEvent(
   config: NotifierConfig,
   eventType: EventType,
@@ -103,14 +121,18 @@ export async function handleEvent(
   sessionTitle?: string | null,
   sessionID?: string | null,
   agentName?: string | null,
-  focusSession?: (sessionID: string) => void
+  focusSession?: (sessionID: string) => void,
+  eligible?: () => boolean,
+  beforePopup?: PopupCheck,
+  identity?: { key?: string; order: number; commit?: () => void },
 ): Promise<void> {
+  const order = identity?.order ?? nextLinuxNotificationOrder()
   // Focus is only queried when some channel cares about it.
   const focusChannels = config.suppressWhenFocused === true ? CHANNELS : config.suppressWhenFocused || []
-  const muted = new Set<Channel>(focusChannels.length > 0 && isTerminalFocused() ? focusChannels : [])
-  if (muted.size === CHANNELS.length) {
-    return
-  }
+  const muted = new Set<Channel>(!beforePopup?.deferFocus && focusChannels.length > 0 && await channelIsFocused() ? focusChannels : [])
+  if (eligible && !eligible()) return
+  identity?.commit?.()
+  if (muted.size === CHANNELS.length) return
 
   if (
     (eventType === "complete" || eventType === "subagent_complete") &&
@@ -124,21 +146,29 @@ export async function handleEvent(
   const promises: Promise<void>[] = []
 
   const timestamp = formatTimestamp()
-  const turn = incrementTurnCount()
-
   const rawMessage = getMessage(config, eventType)
-  const context: MessageContext = {
-    sessionTitle: config.showSessionTitle ? sessionTitle : null,
-    agentName,
-    projectName,
-    timestamp,
-    turn,
+  let contents: { context: MessageContext; message: string } | undefined
+  function describe() {
+    if (contents) return contents
+    const context: MessageContext = {
+      sessionTitle: config.showSessionTitle ? sessionTitle : null,
+      agentName,
+      projectName,
+      timestamp,
+      turn: incrementTurnCount(),
+    }
+    return contents = { context, message: interpolateMessage(rawMessage, context) }
   }
-  const message = interpolateMessage(rawMessage, context)
+  const delayed = beforePopup?.deferFocus === true
+  if (!delayed) describe()
 
   const notificationEnabled = isEventNotificationEnabled(config, eventType) && !muted.has("notification")
   if (notificationEnabled) {
-    const title = getNotificationTitle(config, context)
+    const render = () => {
+      const { context, message } = describe()
+      return { title: getNotificationTitle(config, context), message }
+    }
+    const presentation = delayed ? { title: "", message: rawMessage } : render()
     const iconPath = getIconPath(config)
     const focusOnClick = config.focusOnClick && isTerminalJumpBackSupported()
     const clickCommand = config.onClickCommand
@@ -148,7 +178,8 @@ export async function handleEvent(
       clicked = true
       debugFocusState(`notification activated (event=${eventType}), focusOnClick=${focusOnClick}`)
       if (clickCommand.enabled) {
-        runCommand({ ...config, command: clickCommand }, eventType, message, sessionTitle, agentName, projectName, timestamp, turn, sessionID)
+        const { context, message } = describe()
+        runCommand({ ...config, command: clickCommand }, eventType, message, sessionTitle, agentName, projectName, timestamp, context.turn, sessionID)
       }
       if (focusOnClick) {
         try { if (sessionID) focusSession?.(sessionID) }
@@ -159,8 +190,12 @@ export async function handleEvent(
         )
       }
     } : undefined
-    promises.push(sendNotification(title, message, config.timeout, iconPath, config.notificationSystem, config.linux.grouping,
-      onNotificationClick, config.windows.appID, focusOnClick ? "Jump to terminal" : "Run command"))
+    const checkPopupFocus = usesLinuxDesktopNotifications(config.notificationSystem) && focusChannels.includes("notification")
+    const beforeSend = (beforePopup || checkPopupFocus) ? async (current: () => boolean) => (await beforePopup?.permit?.(current) ?? true) && current() &&
+      (!checkPopupFocus || !(await isTerminalFocused())) : undefined
+    const delivery = { key: identity?.key, order, prompt: eventType === "permission" || eventType === "question", render: delayed ? render : undefined }
+    promises.push(sendNotification(presentation.title, presentation.message, config.timeout, iconPath, config.notificationSystem, config.linux.grouping,
+      onNotificationClick, config.windows.appID, focusOnClick ? "Jump to terminal" : "Run command", eligible, beforeSend, delivery))
   }
 
   if (isEventSoundEnabled(config, eventType) && !muted.has("sound")) {
@@ -178,7 +213,7 @@ export async function handleEvent(
 
   const minDuration = config.command?.minDuration
   const shouldSkipCommand =
-    !isEventCommandEnabled(config, eventType) ||
+    !config.command.enabled || !isEventCommandEnabled(config, eventType) ||
     muted.has("command") ||
     (typeof minDuration === "number" &&
       Number.isFinite(minDuration) &&
@@ -188,7 +223,8 @@ export async function handleEvent(
       elapsedSeconds < minDuration)
 
   if (!shouldSkipCommand) {
-    runCommand(config, eventType, message, sessionTitle, agentName, projectName, timestamp, turn, sessionID)
+    const { context, message } = describe()
+    runCommand(config, eventType, message, sessionTitle, agentName, projectName, timestamp, context.turn, sessionID)
   }
 
   await Promise.allSettled(promises)

@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
 - The V2 terminal waits for active descendant executions even if they have already consumed a report and have no background Job.
 - The V2 terminal detects a descendant turn that finishes between activity checks by reading the server's recorded completion time.
 - The V2 server checks existing descendants after a plugin reload so directly prompted children still delay completion commands.
+- V2 completions recover from missed lifecycle events and ambiguous reused-child reports. Managed services read native Jobs and inboxes after plugin reload. Report cancellation invalidates stale completion, and failed work lookups abort their remaining requests.
+- Linux popups keep distinct prompt identities, skip queued prompts that have settled, and bound the wait behind an unresponsive desktop notifier.
 
 ## [1.1.3] - 2026-11-14
 

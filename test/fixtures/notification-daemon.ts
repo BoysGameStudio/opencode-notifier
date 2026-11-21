@@ -8,17 +8,34 @@ let sender = ""
 let nextID = 1
 export const requests: Array<{ id: number; actions: string[]; timeout: number; sender: string; replaces: number }> = []
 export const visible = new Map<number, { actions: string[]; sender: string }>()
+export let rejectHeldNotification: (() => void) | undefined
+export let confirmHeldNotification: (() => void) | undefined
 export class Notifications extends dbus.interface.Interface {
   constructor() { super(name) }
   GetCapabilities() { return ["actions", "body"] }
   GetServerInformation() { return ["fixture", "fixture", "1", "1.3"] }
   Notify(_app: string, replaces: number, _icon: string, _title: string, _body: string, actions: string[], _hints: unknown, timeout: number) {
+    if (replaces !== 0 && _title === "foreign replacement")
+      throw new dbus.DBusError("org.freedesktop.DBus.Error.InvalidArgs", "Invalid notification ID")
+    if (_title === "rejected replacement") throw new dbus.DBusError("org.freedesktop.DBus.Error.Failed", "Fixture rejected replacement")
+    if (_title === "held failure") return new Promise<number>((_resolve, reject) => {
+      rejectHeldNotification = () => {
+        rejectHeldNotification = undefined
+        reject(new dbus.DBusError("org.freedesktop.DBus.Error.Failed", "Fixture rejected notification"))
+      }
+    })
     const id = replaces || nextID++
     requests.push({ id, actions, timeout, sender, replaces })
     visible.set(id, { actions, sender })
     if (_body === "early") this.ActionInvoked(id, "focus-terminal")
     if (_body === "closed") { this.CloseNotification(id); this.ActionInvoked(id, "focus-terminal") }
     if (_body === "hang") return new Promise(() => {})
+    if (_title === "held confirmation") return new Promise<number>(resolve => {
+      confirmHeldNotification = () => {
+        confirmHeldNotification = undefined
+        resolve(id)
+      }
+    })
     return id
   }
   CloseNotification(id: number) {

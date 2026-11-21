@@ -2,12 +2,22 @@ import { basename } from "path"
 import { loadConfig } from "./config"
 import type { EventType, NotifierConfig } from "./config"
 import { claimDelivery } from "./claim"
-import { deliversAny, extractAgentNameFromSessionTitle, handleEvent, shouldResolveSessionContextForEvent } from "./delivery"
+import { deliversAny, extractAgentNameFromSessionTitle, handleEvent, queuedLinuxPrompt, shouldResolveSessionContextForEvent } from "./delivery"
+import type { PopupCheck } from "./delivery"
+import { nextLinuxNotificationOrder } from "./notify-linux"
 import { debugFocusState as debug } from "./focus"
 import { shouldSuppressPermissionAlert, prunePermissionAlertState } from "./permission-dedupe"
 
+function commandAvailable(config: NotifierConfig, event: EventType) {
+  return config.command.enabled && !!config.command.path && config.events[event].command
+}
+
+// Adapters use this only for diagnostic messages that contain no host payload.
+export class OutstandingWorkError extends Error {}
+
 // Allow immediate auto-approval to settle before checking the pending list.
 export const PERMISSION_PENDING_GRACE_MS = 300
+const PERMISSION_CHECK_TIMEOUT_MS = 750
 const IDLE_COMPLETE_DELAY_MS = 350
 // OpenCode resumes a parent with its children's results right after the last one stops. 2 s leaves
 // room for the parent's busy event while still alerting soon for a parent that never resumes.
@@ -26,10 +36,12 @@ export interface SessionInfo {
 export interface SessionAccess {
   info(sessionID: string): Promise<SessionInfo>
   elapsed(sessionID: string, now: number): Promise<number | null>
-  permissionPending(sessionID: string | null, permissionID: string): Promise<boolean>
-  // V2 TUI: inspect work relative to the host's successful execution event.
-  // Absent on V1 and on server-only V2 delivery.
-  hasOutstandingWork?(sessionID: string, completedAt?: number): Promise<boolean>
+  permissionPending(sessionID: string | null, permissionID: string, signal?: AbortSignal): Promise<boolean>
+  // V2: inspect work relative to the host's successful execution event.
+  hasOutstandingWork?(sessionID: string, completedAt?: number, workVersion?: number, signal?: AbortSignal, placed?: boolean): Promise<boolean>
+  // Full TUI readback includes activity and settlement times. Local lifecycle
+  // events may have gaps, so use them for invalidation rather than readback.
+  authoritativeChildWork?: boolean
   hasObservedOutstandingWork?(sessionID: string): boolean
   // V2 server events know parent/child lifecycle even without the Job API.
   waitForParentResume?: boolean
@@ -40,6 +52,8 @@ export type Delivery = "all" | "terminal" | "command"
 export interface DeliveryHooks {
   // valid() is checked right before the claim is recorded, so a canceled alert leaves its key free for a retry.
   claim?: (key: string, sessionID: string | null, valid: () => boolean) => Promise<boolean>
+  current?: () => boolean
+  dispatchIndependent?: boolean
   focusSession?: (sessionID: string) => void
 }
 
@@ -47,7 +61,11 @@ export interface DeliveryHooks {
 interface NotifyOptions {
   title?: string | null
   now?: number
+  elapsed?: number | null
+  order?: number
   key?: string
+  dispatchIndependent?: boolean
+  stillPending?: (signal?: AbortSignal) => Promise<boolean>
   // Checked after lookups and again around the claim. False skips the alert. Must not change state.
   valid?: () => boolean
   // Runs once the alert passed every check and is about to be delivered.
@@ -64,6 +82,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
   const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const parents = new Map<string, string>()
   const running = new Set<string>()
+  const workChecks = new Map<string, AbortController>()
   // timer drops the alert at deferredCompleteTimeout; grace runs while no descendant is running. The
   // entry stays until delivery, so dropping it or clearing grace cancels an alert already in flight.
   const pending = new Map<string, {
@@ -71,6 +90,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     key?: string
     timer: ReturnType<typeof setTimeout>
     grace?: ReturnType<typeof setTimeout>
+    committed?: boolean
   }>()
   let disposed = false
 
@@ -92,6 +112,8 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
   }
 
   function invalidate(sessionID: string): number {
+    workChecks.get(sessionID)?.abort()
+    workChecks.delete(sessionID)
     touched.set(sessionID, Date.now())
     const sequence = ++nextSequence
     sequences.set(sessionID, sequence)
@@ -109,14 +131,29 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     pending.delete(sessionID)
   }
 
-  async function notify(event: EventType, sessionID: string | null = null, { title, now = Date.now(), key, valid = () => true, commit }: NotifyOptions = {}) {
+  async function checkPermissionPending(check: NonNullable<NotifyOptions["stillPending"]>) {
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        check(controller.signal).catch(() => true),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(true), PERMISSION_CHECK_TIMEOUT_MS) }),
+      ])
+    } finally {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }
+
+  async function notify(event: EventType, sessionID: string | null = null, { title, now = Date.now(), elapsed, key,
+    order = nextLinuxNotificationOrder(), valid = () => true, commit, stillPending, dispatchIndependent }: NotifyOptions = {}) {
     if (disposed) return
+    const eligible = () => !disposed && (hooks.current?.() ?? true) && valid()
     const current = config()
     // Do not count a server event that has no command to deliver.
-    if (delivery === "command" && (!current.command.enabled || !current.command.path || !current.events[event].command)) return
+    if (delivery === "command" && !commandAvailable(current, event)) return
     const lifecycleEvent = event === "session_started" || event === "user_message"
-    let elapsed: number | null = null
-    if (!lifecycleEvent && sessionID && (current.minDuration > 0 || (current.command.enabled && (current.command.minDuration ?? 0) > 0))) {
+    if (elapsed === undefined && !lifecycleEvent && sessionID && (current.minDuration > 0 || (current.command.enabled && (current.command.minDuration ?? 0) > 0))) {
       elapsed = await access.elapsed(sessionID, now)
     }
     let sessionTitle = title ?? null
@@ -126,19 +163,32 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       sessionTitle ??= info.title
       agentName = info.agentName ?? null
     }
-    if (disposed || !valid()) return
+    if (!eligible()) return
+    const linuxPrompt = queuedLinuxPrompt(current, event)
+    const pending = async () => eligible() && (!stillPending || await checkPermissionPending(stillPending))
+    let beforePopup: PopupCheck | undefined = linuxPrompt ? { permit: stillPending ? pending : undefined } : undefined
     if (key && delivery === "terminal") {
       if (!deliversAny(current, event)) {
         debug(`${event}: no channel enabled in this terminal, leaving the event to other terminals`)
         return
       }
       const identity = `${directory}\0${key}`
-      if (!(hooks.claim ? await hooks.claim(identity, sessionID, () => !disposed && valid()) : claimDelivery(identity))) return
+      let claimed: Promise<boolean> | undefined
+      const claim = async (current = eligible) => claimed ??= hooks.claim ? hooks.claim(identity, sessionID, current) : Promise.resolve(current() && claimDelivery(identity))
+      if (linuxPrompt === "popup-only") beforePopup = { permit: async current => {
+        if (!claimed && !(await pending())) return false
+        return current() && await claim(current) && pending()
+      }, deferFocus: true }
+      else if (!(await claim())) return
     }
-    if (disposed || !valid()) return
-    commit?.()
+    if (!eligible()) return
     const project = directory ? (current.showFullPath ? directory : basename(directory)) : null
-    await handleEvent(current, event, project, elapsed, sessionTitle, sessionID, agentName ?? extractAgentNameFromSessionTitle(sessionTitle), hooks.focusSession)
+    const independent = dispatchIndependent || hooks.dispatchIndependent
+    const dispatched = handleEvent(current, event, project, elapsed ?? null, sessionTitle, sessionID,
+      agentName ?? extractAgentNameFromSessionTitle(sessionTitle), hooks.focusSession, eligible, beforePopup, { key, order, commit })
+    // Native desktop and audio callbacks can outlive the session decision.
+    if (independent) void dispatched.catch(() => undefined)
+    else await dispatched
   }
 
   // A new child can start after a parent has checked Job/inbox state but
@@ -149,8 +199,8 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     return !!(access.waitForParentResume || access.hasOutstandingWork) && config().deferCompleteUntilChildrenIdle
   }
 
-  function invalidateAncestors(sessionID: string) {
-    if (!strictParentTracking()) return
+  function invalidateAncestors(sessionID: string, defer?: boolean) {
+    if (!(defer ?? strictParentTracking())) return
     const seen = new Set<string>([sessionID])
     let ancestor = parents.get(sessionID)
     while (ancestor && !seen.has(ancestor)) {
@@ -188,8 +238,8 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     }
   }
 
-  function hasRunningChildren(parentID: string): boolean {
-    for (const id of running) {
+  function hasRunningChildren(parentID: string, active: Iterable<string> = running): boolean {
+    for (const id of active) {
       const seen = new Set<string>([id])
       let ancestor = parents.get(id)
       while (ancestor && !seen.has(ancestor)) {
@@ -209,10 +259,16 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     // A fixed grace cannot guarantee the parent has resumed.
     if ((access.waitForParentResume || access.hasOutstandingWork) && config().deferCompleteUntilChildrenIdle) return
     for (const [id, deferred] of pending) {
-      if (deferred.grace || hasRunningChildren(id)) continue
+      if (deferred.committed || deferred.grace || hasRunningChildren(id)) continue
       const grace = setTimeout(() => {
         const valid = () => pending.get(id) === deferred && deferred.grace === grace
-        void notify("complete", id, { title: deferred.title, key: deferred.key, valid, commit: () => drop(id) }).catch(() => undefined)
+        const commit = () => {
+          deferred.committed = true
+          clearTimeout(deferred.timer)
+        }
+        void notify("complete", id, { title: deferred.title, key: deferred.key, valid, commit }).catch(() => undefined).finally(() => {
+          if (deferred.committed && pending.get(id) === deferred) drop(id)
+        })
       }, CHILDREN_SETTLE_MS)
       grace.unref()
       deferred.grace = grace
@@ -223,43 +279,70 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
   function holdGrace() {
     for (const [id, deferred] of pending) {
       if (!deferred.grace || !hasRunningChildren(id)) continue
+      if (deferred.committed) {
+        drop(id)
+        continue
+      }
       clearTimeout(deferred.grace)
       deferred.grace = undefined
     }
   }
 
-  async function complete(sessionID: string, sequence: number, now: number, key?: string, blockedAtReceipt = false, completedAt?: number) {
+  async function complete(sessionID: string, sequence: number, now: number, key?: string, blockedAtReceipt = false, completedAt?: number, workVersion?: number, details?: { info: SessionInfo; placed: boolean }) {
     if (disposed || sequences.get(sessionID) !== sequence) return
     if (errors.delete(sessionID)) return
-    if (children.has(sessionID)) {
+    if (!details && children.has(sessionID)) {
       await notify("subagent_complete", sessionID, { now, key, valid: () => sequences.get(sessionID) === sequence })
       return
     }
-    const info = await access.info(sessionID)
+    const info = details?.info ?? await access.info(sessionID)
     if (disposed || sequences.get(sessionID) !== sequence || errors.delete(sessionID)) return
     if (info.isChild === null) return
     if (info.isChild) children.add(sessionID)
     const current = config()
+    const event = info.isChild ? "subagent_complete" : "complete"
+    if (delivery === "command" && !commandAvailable(current, event)) return
+    if (delivery === "terminal" && !deliversAny(current, event)) return
     let outstanding = blockedAtReceipt
+    let workUnknown = false
+    let elapsed: number | null | undefined
     if (!outstanding && !info.isChild && current.deferCompleteUntilChildrenIdle && access.hasOutstandingWork) {
+      const minDuration = Math.max(current.minDuration, current.command.minDuration ?? 0)
+      if (delivery === "command" && minDuration > 0) {
+        elapsed = await access.elapsed(sessionID, now)
+        if (disposed || sequences.get(sessionID) !== sequence) return
+        if (elapsed !== null && Number.isFinite(elapsed) && elapsed < minDuration) return
+      }
+      const check = new AbortController()
+      workChecks.set(sessionID, check)
       try {
-        outstanding = await access.hasOutstandingWork(sessionID, completedAt)
-      } catch {
+        outstanding = await access.hasOutstandingWork(sessionID, completedAt, workVersion, check.signal, details?.placed)
+      } catch (error) {
         // Losing the Job/inbox API must not turn uncertainty into a false "complete".
+        if (!check.signal.aborted) {
+          const reason = error instanceof OutstandingWorkError ? error.message
+            : error instanceof Error && error.name === "TimeoutError" ? "inbox read timed out" : "request failed"
+          debug(`Session ${sessionID}: child work check unavailable (${reason})`)
+        }
         outstanding = true
+        workUnknown = true
+      } finally {
+        if (workChecks.get(sessionID) === check) workChecks.delete(sessionID)
       }
     }
     // A parent may resume while metadata or outstanding work is being queried.
     if (disposed || sequences.get(sessionID) !== sequence) return
-    if (!info.isChild && current.deferCompleteUntilChildrenIdle && (hasRunningChildren(sessionID) || outstanding || access.hasObservedOutstandingWork?.(sessionID))) {
+    if (!info.isChild && current.deferCompleteUntilChildrenIdle && (outstanding ||
+        (!access.authoritativeChildWork && hasRunningChildren(sessionID)) || access.hasObservedOutstandingWork?.(sessionID))) {
       // Expiry drops the pending alert; it must not claim completion while work is still active.
       const timer = setTimeout(() => drop(sessionID), current.deferredCompleteTimeout)
       timer.unref()
       pending.set(sessionID, { title: info.title, key, timer })
+      debug(`Session ${sessionID}: completion deferred (${workUnknown ? "work state unknown" : "child work outstanding"})`)
       return
     }
-    await notify(info.isChild ? "subagent_complete" : "complete", sessionID, {
-      title: info.title, now, key,
+    await notify(event, sessionID, {
+      title: info.title, now, elapsed, key,
       // Lookups and delivery claims can race with the next execution.started event.
       valid: () => sequences.get(sessionID) === sequence &&
         (info.isChild || !current.deferCompleteUntilChildrenIdle || !access.hasObservedOutstandingWork?.(sessionID)),
@@ -270,6 +353,7 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
   const cleanup = setInterval(() => {
     const cutoff = Date.now() - 5 * 60_000
     prunePermissionAlertState(cutoff)
+    const preserveParents = strictParentTracking()
     for (const [id, lastSeen] of touched) {
       if (lastSeen >= cutoff || idleTimers.has(id) || running.has(id) || pending.has(id) || hasRunningChildren(id)) continue
       touched.delete(id)
@@ -278,20 +362,30 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       errors.delete(id)
       // V2 native Subagents may restart after hours of idle time, without
       // another session.created event. Retain bounded ancestry for that case.
-      if (!strictParentTracking()) parents.delete(id)
+      if (!preserveParents) parents.delete(id)
     }
-    if (strictParentTracking()) trimParentLinks()
+    if (preserveParents) trimParentLinks()
   }, 5 * 60_000)
   cleanup.unref()
 
   return {
+    delivers(event: EventType) {
+      const current = config()
+      return delivery === "command" ? commandAvailable(current, event) : deliversAny(current, event)
+    },
     notify,
     track,
     invalidate,
     invalidateAncestors,
+    hasRunningChildren,
+    isTrackedChild: (id: string) => children.has(id),
+    hasTrackedChildren(id: string) {
+      for (const parent of parents.values()) if (parent === id) return true
+      return false
+    },
     settled(id: string) {
       running.delete(id)
-      return { sequence: sequences.get(id) ?? invalidate(id), runningChildren: strictParentTracking() && hasRunningChildren(id) }
+      return { sequence: invalidate(id), runningChildren: !access.authoritativeChildWork && strictParentTracking() && hasRunningChildren(id) }
     },
     completionCurrent(id: string, sequence: number) {
       return sequences.get(id) === sequence
@@ -319,22 +413,22 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       invalidateAncestors(id)
       holdGrace()
     },
-    async idle(id: string | null, immediate = true, key?: string, blockedAtReceipt = false, completedAt?: number) {
+    async idle(id: string | null, immediate = true, key?: string, blockedAtReceipt = false, completedAt?: number, workVersion?: number, details?: { info: SessionInfo; placed: boolean }) {
       if (disposed) return
       if (!id) return notify("complete")
       // Its busy would have dropped the alert, so this is a repeated idle. Keep the current wait.
       if (pending.has(id)) return
       const sequence = invalidate(id)
       running.delete(id)
-      const now = Date.now()
+      const now = completedAt ?? Date.now()
       if (immediate) {
-        await complete(id, sequence, now, key, blockedAtReceipt, completedAt)
+        await complete(id, sequence, now, key, blockedAtReceipt, completedAt, workVersion, details)
         startGrace()
         return
       }
       idleTimers.set(id, setTimeout(() => {
         idleTimers.delete(id)
-        void complete(id, sequence, now, key, blockedAtReceipt, completedAt).then(startGrace).catch(() => undefined)
+        void complete(id, sequence, now, key, blockedAtReceipt, completedAt, workVersion, details).then(startGrace).catch(() => undefined)
       }, IDLE_COMPLETE_DELAY_MS))
     },
     stopped(id: string) {
@@ -368,15 +462,17 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
       await notify(event, id, { key })
       startGrace()
     },
-    async permission(id: string | null, requestID: string | null, legacyHook = false, key?: string) {
-      if (requestID) {
+    async permission(id: string | null, requestID: string | null, legacyHook = false, key?: string, valid?: () => boolean, order = nextLinuxNotificationOrder()) {
+      if (disposed || valid?.() === false || !deliversAny(config(), "permission")) return
+      const stillPending = requestID ? (signal?: AbortSignal) => access.permissionPending(id, requestID, signal) : undefined
+      if (stillPending) {
         await new Promise(resolve => setTimeout(resolve, PERMISSION_PENDING_GRACE_MS))
-        if (disposed || !(await access.permissionPending(id, requestID))) return
+        if (disposed || !(await (legacyHook ? checkPermissionPending(stillPending) : stillPending()))) return
       }
-      if (disposed) return
+      if (disposed || valid?.() === false) return
       // V1 has two permission sources. V2 adapters dedupe by request identity.
-      if (legacyHook && shouldSuppressPermissionAlert(id)) return
-      await notify("permission", id, { key })
+      if (legacyHook && shouldSuppressPermissionAlert(id, Date.now(), requestID)) return
+      await notify("permission", id, { key: key ?? (requestID ? `permission:${requestID}` : undefined), order, valid, stillPending })
     },
     async userMessage(id: string | null, verifyParent = false, key?: string) {
       if (id && children.has(id)) return
@@ -388,6 +484,8 @@ export function createNotifier(access: SessionAccess, directory: string, deliver
     },
     dispose() {
       disposed = true
+      for (const check of workChecks.values()) check.abort()
+      workChecks.clear()
       clearInterval(cleanup)
       for (const timer of idleTimers.values()) clearTimeout(timer)
       idleTimers.clear()

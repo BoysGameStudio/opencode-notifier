@@ -54,7 +54,7 @@ export function getPermissionIDFromEvent(event: unknown): string | null {
 
 // True when the request is still awaiting approval. Fails open: any lookup
 // failure means "unknown", and unknown must notify rather than stay silent.
-export async function isPermissionStillPending(client: unknown, permissionID: string): Promise<boolean> {
+export async function isPermissionStillPending(client: unknown, permissionID: string, signal?: AbortSignal): Promise<boolean> {
   try {
     // The v1 SDK client type exposes no permission.list API, so go through
     // the raw HTTP client, with shape checks at this untyped boundary.
@@ -63,7 +63,7 @@ export async function isPermissionStillPending(client: unknown, permissionID: st
     if (!inner || typeof inner.get !== "function") {
       return true
     }
-    const listResponse: unknown = await inner.get({ url: "/permission" })
+    const listResponse: unknown = await inner.get({ url: "/permission", ...(signal ? { signal } : {}) })
     const body = asRecord(listResponse)?.data ?? listResponse
     const pendingList = Array.isArray(body) ? body : asRecord(body)?.data
     if (!Array.isArray(pendingList)) {
@@ -127,9 +127,28 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
         return null
       }
     },
-    permissionPending: (_id, requestID) => isPermissionStillPending(client, requestID),
+    permissionPending: (_id, requestID, signal) => isPermissionStillPending(client, requestID, signal),
   }, directory)
   const isCLI = isCLIClient(clientEnv)
+  type QuestionAlert = { sessionID: string; closed: boolean }
+  const questionRequests = new Map<string, { alert?: QuestionAlert; closed: boolean }>()
+  const questionCalls = new Map<string, QuestionAlert>()
+  const closedPermissions = new Map<string, true>()
+  function rememberAlert<T>(map: Map<string, T>, key: string, value: T) {
+    map.delete(key)
+    map.set(key, value)
+    if (map.size > 2048) map.delete(map.keys().next().value!)
+  }
+  function closeSessionQuestions(sessionID: string) {
+    for (const [key, alert] of questionCalls) if (alert.sessionID === sessionID) {
+      alert.closed = true
+      questionCalls.delete(key)
+    }
+  }
+  function alertPermission(sessionID: string | null, requestID: string | null) {
+    const valid = () => !requestID || !closedPermissions.has(requestID)
+    void notifier.permission(sessionID, requestID, true, undefined, valid).catch(() => undefined)
+  }
   const connected = () => void notifier.notify("client_connected").catch(() => undefined)
   const connectedTimer = isCLI ? undefined : setTimeout(connected, 100)
   if (isCLI) connected()
@@ -139,11 +158,28 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
       disposeLinuxNotifications()
       clearTimeout(connectedTimer)
       notifier.dispose()
+      questionRequests.clear()
+      questionCalls.clear()
+      closedPermissions.clear()
     },
     async event({ event }) {
       try {
         const type = asRecord(event)?.type
         const sessionID = getSessionIDFromEvent(event)
+        if (sessionID && (type === "question.asked" || type === "question.replied" || type === "question.rejected")) {
+          const properties = getNestedRecord(event, "properties")
+          const asked = type === "question.asked"
+          const id = getStringField(properties, asked ? "id" : "requestID")
+          const callID = asked ? getStringField(getNestedRecord(properties, "tool"), "callID") : null
+          if (id) {
+            const key = `${sessionID}\0${id}`
+            const previous = questionRequests.get(key)
+            const alert = callID ? questionCalls.get(`${sessionID}\0${callID}`) : previous?.alert
+            const closed = !asked || previous?.closed === true
+            if (closed && alert) alert.closed = true
+            rememberAlert(questionRequests, key, { alert, closed })
+          }
+        }
         if (type === "session.created" || type === "session.updated") {
           const info = getSessionLifecycleInfo(event)
           if (type === "session.created") await notifier.created(info.id, info.parentID, info.title)
@@ -152,17 +188,29 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
         // Stop deleted work while retaining child tombstones for late idle events.
         if (type === "session.deleted") {
           const id = getSessionLifecycleInfo(event).id
-          if (id) await notifier.stopped(id)
+          if (id) {
+            closeSessionQuestions(id)
+            await notifier.stopped(id)
+          }
         }
         if (type === "permission.asked") {
-          await notifier.permission(sessionID, getPermissionIDFromEvent(event), true)
+          alertPermission(sessionID, getPermissionIDFromEvent(event))
         }
-        if (type === "session.idle") await notifier.idle(sessionID, isCLI)
+        if (type === "permission.replied") {
+          const properties = getNestedRecord(event, "properties")
+          const requestID = getStringField(properties, "requestID") ?? getStringField(properties, "permissionID")
+          if (requestID) rememberAlert(closedPermissions, requestID, true)
+        }
+        if (type === "session.idle") {
+          if (sessionID) closeSessionQuestions(sessionID)
+          await notifier.idle(sessionID, isCLI)
+        }
         if (type === "session.status" && getNestedRecord(event, "properties", "status")?.type === "busy" && sessionID) {
           notifier.busy(sessionID)
         }
         if (type === "session.error") {
           const cancelled = getNestedRecord(event, "properties", "error")?.name === "MessageAbortedError"
+          if (sessionID) closeSessionQuestions(sessionID)
           await notifier.failed(sessionID, cancelled ? "user_cancelled" : "error")
         }
         if (type === "message.updated") {
@@ -173,13 +221,23 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
         // Notification failures must not interrupt the host.
       }
     },
-    "permission.ask": async () => {
-      try { await notifier.permission(null, null, true) } catch {}
+    "permission.ask": async (input) => {
+      try {
+        const request = asRecord(input)
+        alertPermission(getStringField(request, "sessionID"), getStringField(request, "id"))
+      } catch {}
     },
     "tool.execute.before": async (input) => {
       try {
         if (input.tool === "question" || input.tool === "plan_exit") {
-          await notifier.notify(input.tool, getStringField(asRecord(input), "sessionID"))
+          const sessionID = getStringField(asRecord(input), "sessionID")
+          const callID = getStringField(asRecord(input), "callID")
+          const alert = input.tool === "question" && sessionID && callID ? { sessionID, closed: false } : undefined
+          const question = alert ? `${sessionID}\0${callID}` : undefined
+          if (question && alert) rememberAlert(questionCalls, question, alert)
+          await notifier.notify(input.tool, sessionID, {
+            key: question ? `question:${question}` : undefined, dispatchIndependent: true, valid: () => !alert?.closed,
+          })
         }
       } catch {}
     },
