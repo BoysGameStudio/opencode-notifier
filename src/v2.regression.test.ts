@@ -333,3 +333,23 @@ test("V2 reads Job registry before Inbox to prevent cross-snapshot false complet
   expect(order).toEqual(["jobs", "inbox"])
   expect(output).toHaveLength(0)
 })
+
+test("foreign session.created is not delivered when the ownership lookup is unavailable", async () => {
+  const input = event("session.created", {
+    sessionID: "foreign-created",
+    location: { directory: "/another-workspace" },
+    title: "Foreign session",
+  })
+  // The event has no envelope, and session.get fails. data.location must win
+  // over a fallback decision to announce a session from another workspace.
+  const output = await exercise([input], { missing: true })
+  expect(output).toHaveLength(0)
+})
+
+test("V2 completion fails closed on an unresolved session location, but questions still notify", async () => {
+  const complete = event("session.execution.succeeded", { sessionID: "unknown-location" })
+  const question = event("form.created", { form: { id: "ownership-unknown", sessionID: "unknown-location", metadata: { kind: "question" } } })
+  const output = await exercise([complete, question], { missing: true })
+  expect(output.filter(value => value.includes("PROBE_DONE"))).toHaveLength(0)
+  expect(output.filter(value => value.includes("PROBE_QUESTION"))).toHaveLength(1)
+})

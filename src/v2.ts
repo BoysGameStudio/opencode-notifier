@@ -73,7 +73,7 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
   const notifier = createNotifier({
     async info(sessionID) {
       try {
-        const session = await client.session.get({ sessionID })
+        const session = await boundedWorkQuery(signal => client.session.get({ sessionID }, { signal }))
         return { isChild: !!session.parentID, title: session.title ?? null, agentName: session.parentID ? session.agent ?? null : null }
       } catch {
         return { isChild: null, title: null }
@@ -121,7 +121,10 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
     } : {}),
   }, location.directory, delivery, hooks)
   const seen = new Set<string>()
-  const owned = new Map<string, Promise<boolean>>()
+  // null means ownership is unresolved, not that the session belongs here.
+  // Completion must fail closed on unknown ownership; permission/question
+  // prompts retain their historical fail-open behavior.
+  const owned = new Map<string, Promise<boolean | null>>()
   // Versions are per-session and removed after terminal handling. A global
   // monotonically increasing token prevents accidental reuse across sessions.
   const startVersions = new Map<string, number>()
@@ -153,12 +156,12 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
   function ours(sessionID: string) {
     let result = owned.get(sessionID)
     if (!result) {
-      result = client.session.get({ sessionID }).then(
+      result = boundedWorkQuery(signal => client.session.get({ sessionID }, { signal })).then(
         session => !session.location || here(session.location),
         () => {
-          debug(`v2 session ${sessionID}: lookup failed, delivering`)
+          debug(`v2 session ${sessionID}: ownership lookup unavailable`)
           owned.delete(sessionID)
-          return true
+          return null
         },
       )
       owned.set(sessionID, result)
@@ -241,10 +244,17 @@ export function createV2Notifier(client: Client, location: LocationRef, delivery
         const cached = sessionID ? owned.get(sessionID) : undefined
         if (sessionID && (event.type === "session.moved" || event.type === "session.deleted")) owned.delete(sessionID)
         // A deleted session can no longer be looked up, so only a cached answer can drop it.
-        const mine = event.location ? here(event.location)
+        // session.created carries authoritative location in its payload even
+        // when there is no location envelope. Never override that with a
+        // fail-open API lookup that may return the wrong workspace.
+        const owner = event.location ? here(event.location)
+          : event.type === "session.created" && event.data.location ? here(event.data.location)
           : !sessionID ? true
           : event.type === "session.deleted" ? !cached || await cached
           : await ours(sessionID)
+        const mine = owner === null
+          ? event.type !== "session.execution.succeeded"
+          : owner
         if (!mine) {
           // A move can be delivered to both the former and new locations.
           // Its synchronous receipt already invalidated a pending completion
